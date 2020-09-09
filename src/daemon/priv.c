@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -36,6 +37,11 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 #include <netinet/if_ether.h>
+
+#ifdef HAVE_LINUX_CAPABILITIES
+#include <sys/capability.h>
+#include <sys/prctl.h>
+#endif
 
 #if defined HOST_OS_FREEBSD || HOST_OS_OSX || HOST_OS_DRAGONFLY
 # include <net/if_dl.h>
@@ -114,7 +120,7 @@ priv_gethostname()
 
 
 int
-priv_iface_init(int index, char *iface)
+priv_iface_init(int index, char *iface, int proto)
 {
 	int rc;
 	char dev[IFNAMSIZ] = {};
@@ -123,6 +129,7 @@ priv_iface_init(int index, char *iface)
 	must_write(PRIV_UNPRIVILEGED, &index, sizeof(int));
 	strlcpy(dev, iface, IFNAMSIZ);
 	must_write(PRIV_UNPRIVILEGED, dev, IFNAMSIZ);
+	must_write(PRIV_UNPRIVILEGED, &proto, sizeof(int));
 	priv_wait();
 	must_read(PRIV_UNPRIVILEGED, &rc, sizeof(int));
 	if (rc != 0) return -1;
@@ -244,13 +251,15 @@ asroot_iface_init()
 {
 	int rc = -1, fd = -1;
 	int ifindex;
+	int proto;
 	char name[IFNAMSIZ];
 	must_read(PRIV_PRIVILEGED, &ifindex, sizeof(ifindex));
 	must_read(PRIV_PRIVILEGED, &name, sizeof(name));
 	name[sizeof(name) - 1] = '\0';
+	must_read(PRIV_PRIVILEGED, &proto, sizeof(proto));
 
 	TRACE(LLDPD_PRIV_INTERFACE_INIT(name));
-	rc = asroot_iface_init_os(ifindex, name, &fd);
+	rc = asroot_iface_init_os(ifindex, name, &fd, proto);
 	must_write(PRIV_PRIVILEGED, &rc, sizeof(rc));
 	if (rc == 0 && fd >=0) send_fd(PRIV_PRIVILEGED, fd);
 	if (fd >= 0) close(fd);
@@ -387,9 +396,6 @@ static struct dispatch_actions actions[] = {
 	{PRIV_GET_HOSTNAME, asroot_gethostname},
 #ifdef HOST_OS_LINUX
 	{PRIV_OPEN, asroot_open},
-# ifdef ENABLE_OLDIES
-	{PRIV_ETHTOOL, asroot_ethtool},
-# endif
 #endif
 	{PRIV_IFACE_INIT, asroot_iface_init},
 	{PRIV_IFACE_MULTICAST, asroot_iface_multicast},
@@ -491,7 +497,9 @@ sig_pass_to_chld(int sig)
 	errno = oerrno;
 }
 
-/* if parent gets a SIGCHLD, it will exit */
+/* If priv parent gets a SIGCHLD, it will exit if this is the monitored
+ * process. Other processes (including lldpcli)) are just reaped without
+ * consequences. */
 static void
 sig_chld(int sig)
 {
@@ -506,18 +514,40 @@ sig_chld(int sig)
 	priv_exit_rc_status(rc, status);
 }
 
+/* Create a directory recursively. */
+static int mkdir_p(const char *pathname, mode_t mode)
+{
+	char path[PATH_MAX+1], current[PATH_MAX+1] = {};
+	char *tok;
+
+	if (strlcpy(path, pathname, sizeof(path)) >= sizeof(path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	/* Use strtok which will provides non-empty tokens only. */
+	if (path[0] == '/') current[0] = '/';
+	tok = strtok(path, "/");
+	while (tok) {
+		strcat(current, tok);
+		if (mkdir(current, mode) != 0 && errno != EEXIST)
+			return -1;
+		strcat(current, "/");
+		tok = strtok(NULL, "/");
+	}
+
+	errno = 0;
+	return 0;
+}
+
 /* Initialization */
 #define LOCALTIME "/etc/localtime"
 static void
 priv_setup_chroot(const char *chrootdir)
 {
 	/* Create chroot if it does not exist */
-	if (mkdir(chrootdir, 0755) == -1) {
-		if (errno != EEXIST)
-			fatal("privsep", "unable to create chroot directory");
-	} else {
-		log_info("privsep", "created chroot directory %s",
-		    chrootdir);
+	if (mkdir_p(chrootdir, 0755) == -1) {
+		fatal("privsep", "unable to create chroot directory");
 	}
 
 	/* Check if /etc/localtime exists in chroot or outside chroot */
@@ -583,7 +613,76 @@ priv_setup_chroot(const char *chrootdir)
 	close(source);
 	close(destination);
 }
+#else /* !ENABLE_PRIVSEP */
+
+/* Reap any children. It should only be lldpcli since there is not monitored
+ * process. */
+static void
+sig_chld(int sig)
+{
+	int status = 0;
+	while (waitpid(-1, &status, WNOHANG) > 0);
+}
+
 #endif
+
+void
+priv_drop(uid_t uid, gid_t gid)
+{
+	gid_t gidset[1];
+	gidset[0] = gid;
+	log_debug("privsep", "dropping privileges");
+#ifdef HAVE_SETRESGID
+	if (setresgid(gid, gid, gid) == -1)
+		fatal("privsep", "setresgid() failed");
+#else
+	if (setregid(gid, gid) == -1)
+		fatal("privsep", "setregid() failed");
+#endif
+	if (setgroups(1, gidset) == -1)
+		fatal("privsep", "setgroups() failed");
+#ifdef HAVE_SETRESUID
+	if (setresuid(uid, uid, uid) == -1)
+		fatal("privsep", "setresuid() failed");
+#else
+	if (setreuid(uid, uid) == -1)
+		fatal("privsep", "setreuid() failed");
+#endif
+}
+
+void
+priv_caps(uid_t uid, gid_t gid)
+{
+#ifdef HAVE_LINUX_CAPABILITIES
+	cap_t caps;
+	const char *caps_strings[2] = {
+		"cap_dac_override,cap_net_raw,cap_net_admin,cap_setuid,cap_setgid=pe",
+		"cap_dac_override,cap_net_raw,cap_net_admin=pe"
+	};
+	log_debug("privsep", "getting CAP_NET_RAW/ADMIN and CAP_DAC_OVERRIDE privilege");
+	if (!(caps = cap_from_text(caps_strings[0])))
+		fatal("privsep", "unable to convert caps");
+	if (cap_set_proc(caps) == -1) {
+		log_warn("privsep", "unable to drop privileges, monitor running as root");
+		cap_free(caps);
+		return;
+	}
+	cap_free(caps);
+
+	if (prctl(PR_SET_KEEPCAPS, 1L, 0L, 0L, 0L) == -1)
+		fatal("privsep", "cannot keep capabilities");
+	priv_drop(uid, gid);
+
+	log_debug("privsep", "dropping extra capabilities");
+	if (!(caps = cap_from_text(caps_strings[1])))
+		fatal("privsep", "unable to convert caps");
+	if (cap_set_proc(caps) == -1)
+		fatal("privsep", "unable to drop extra privileges");
+	cap_free(caps);
+#else
+	log_info("privsep", "no libcap support, running monitor as root");
+#endif
+}
 
 void
 priv_init(const char *chrootdir, int ctl, uid_t uid, gid_t gid)
@@ -601,8 +700,6 @@ priv_init(const char *chrootdir, int ctl, uid_t uid, gid_t gid)
 	priv_privileged_fd(pair[1]);
 
 #ifdef ENABLE_PRIVSEP
-	gid_t gidset[1];
-        int status;
 	/* Spawn off monitor */
 	if ((monitored = fork()) < 0)
 		fatal("privsep", "unable to fork monitor");
@@ -617,23 +714,7 @@ priv_init(const char *chrootdir, int ctl, uid_t uid, gid_t gid)
 				fatal("privsep", "unable to chroot");
 			if (chdir("/") != 0)
 				fatal("privsep", "unable to chdir");
-			gidset[0] = gid;
-#ifdef HAVE_SETRESGID
-			if (setresgid(gid, gid, gid) == -1)
-				fatal("privsep", "setresgid() failed");
-#else
-			if (setregid(gid, gid) == -1)
-				fatal("privsep", "setregid() failed");
-#endif
-			if (setgroups(1, gidset) == -1)
-				fatal("privsep", "setgroups() failed");
-#ifdef HAVE_SETRESUID
-			if (setresuid(uid, uid, uid) == -1)
-				fatal("privsep", "setresuid() failed");
-#else
-			if (setreuid(uid, uid) == -1)
-				fatal("privsep", "setreuid() failed");
-#endif
+			priv_drop(uid, gid);
 		}
 		close(pair[1]);
 		priv_ping();
@@ -644,6 +725,8 @@ priv_init(const char *chrootdir, int ctl, uid_t uid, gid_t gid)
 		close(pair[0]);
 		if (atexit(priv_exit) != 0)
 			fatal("privsep", "unable to set exit function");
+
+		priv_caps(uid, gid);
 
 		/* Install signal handlers */
 		const struct sigaction pass_to_child = {
@@ -660,14 +743,17 @@ priv_init(const char *chrootdir, int ctl, uid_t uid, gid_t gid)
 			.sa_flags = SA_RESTART
 		};
 		sigaction(SIGCHLD, &child, NULL);
-
-                if (waitpid(monitored, &status, WNOHANG) != 0)
-                        /* Child is already dead */
-                        _exit(1);
+		sig_chld(0);	/* Reap already dead children */
 		priv_loop(pair[1], 0);
 		exit(0);
 	}
 #else
+	const struct sigaction child = {
+		.sa_handler = sig_chld,
+		.sa_flags = SA_RESTART
+	};
+	sigaction(SIGCHLD, &child, NULL);
+	sig_chld(0);	/* Reap already dead children */
 	log_warnx("priv", "no privilege separation available");
 	priv_ping();
 #endif

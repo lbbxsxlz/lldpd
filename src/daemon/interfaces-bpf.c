@@ -17,6 +17,7 @@
 
 #include "lldpd.h"
 #include <unistd.h>
+#include <errno.h>
 #include <net/bpf.h>
 
 struct bpf_buffer {
@@ -33,7 +34,7 @@ ifbpf_phys_init(struct lldpd *cfg,
 
 	log_debug("interfaces", "initialize ethernet device %s",
 	    hardware->h_ifname);
-	if ((fd = priv_iface_init(hardware->h_ifindex, hardware->h_ifname)) == -1)
+	if ((fd = priv_iface_init(hardware->h_ifindex, hardware->h_ifname, 0)) == -1)
 		return -1;
 
 	/* Allocate receive buffer */
@@ -88,9 +89,14 @@ ifbpf_eth_recv(struct lldpd *cfg,
 	/* We assume we have only receive one packet (unbuffered mode). Dunno if
 	 * this is correct. */
 	if (read(fd, bpfbuf->data, bpfbuf->len) == -1) {
-		log_warn("interfaces", "error while receiving frame on %s",
-		    hardware->h_ifname);
-		hardware->h_rx_discarded_cnt++;
+		if (errno == ENETDOWN) {
+			log_debug("interfaces", "error while receiving frame on %s (network down)",
+			    hardware->h_ifname);
+		} else {
+			log_warn("interfaces", "error while receiving frame on %s",
+			    hardware->h_ifname);
+			hardware->h_rx_discarded_cnt++;
+		}
 		return -1;
 	}
 	bh = (struct bpf_hdr*)bpfbuf->data;

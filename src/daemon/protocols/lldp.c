@@ -25,7 +25,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 
-inline static int
+static int
 lldpd_af_to_lldp_proto(int af)
 {
 	switch (af) {
@@ -38,7 +38,7 @@ lldpd_af_to_lldp_proto(int af)
 	}
 }
 
-inline static int
+static int
 lldpd_af_from_lldp_proto(int proto)
 {
 	switch (proto) {
@@ -107,7 +107,21 @@ static int _lldp_send(struct lldpd *global,
 	      /* LLDP multicast address */
 	      POKE_BYTES(mcastaddr, ETHER_ADDR_LEN) &&
 	      /* Source MAC address */
-	      POKE_BYTES(&hardware->h_lladdr, ETHER_ADDR_LEN) &&
+	      POKE_BYTES(&hardware->h_lladdr, ETHER_ADDR_LEN)))
+		goto toobig;
+
+	/* Insert VLAN tag if needed */
+	if (port->p_vlan_tx_enabled) {
+		if (!(
+		     /* VLAN ethertype */
+		     POKE_UINT16(ETHERTYPE_VLAN) &&
+		     /* VLAN Tag Control Information (TCI) */
+		     /* Priority(3bits) | DEI(1bit) | VID(12bit) */
+		     POKE_UINT16(port->p_vlan_tx_tag)))
+			goto toobig;
+	}
+
+	if (!(
 	      /* LLDP frame */
 	      POKE_UINT16(ETHERTYPE_LLDP)))
 		goto toobig;
@@ -131,7 +145,7 @@ static int _lldp_send(struct lldpd *global,
 	/* Time to live */
 	if (!(
 	      POKE_START_LLDP_TLV(LLDP_TLV_TTL) &&
-	      POKE_UINT16(shutdown?0:chassis->c_ttl) &&
+	      POKE_UINT16(shutdown?0:(global?global->g_config.c_ttl:180)) &&
 	      POKE_END_LLDP_TLV))
 		goto toobig;
 
@@ -294,33 +308,59 @@ static int _lldp_send(struct lldpd *global,
 	/* Power */
 	if (port->p_power.devicetype) {
 		if (!(
-		      POKE_START_LLDP_TLV(LLDP_TLV_ORG) &&
+		      (port->p_power.type_ext != LLDP_DOT3_POWER_8023BT_OFF ?
+		      (tlv = pos, POKE_UINT16((LLDP_TLV_ORG << 9) | (0x1d))):
+		      POKE_START_LLDP_TLV(LLDP_TLV_ORG)) &&
 		      POKE_BYTES(dot3, sizeof(dot3)) &&
 		      POKE_UINT8(LLDP_TLV_DOT3_POWER) &&
 		      POKE_UINT8((
-				  (((2 - port->p_power.devicetype)    %(1<< 1))<<0) |
-				  (( port->p_power.supported          %(1<< 1))<<1) |
-				  (( port->p_power.enabled            %(1<< 1))<<2) |
-				  (( port->p_power.paircontrol        %(1<< 1))<<3))) &&
+				(((2 - port->p_power.devicetype)    %(1<< 1))<<0) |
+			        (( port->p_power.supported          %(1<< 1))<<1) |
+			        (( port->p_power.enabled            %(1<< 1))<<2) |
+			        (( port->p_power.paircontrol        %(1<< 1))<<3))) &&
 		      POKE_UINT8(port->p_power.pairs) &&
 		      POKE_UINT8(port->p_power.class)))
 			goto toobig;
 		/* 802.3at */
 		if (port->p_power.powertype != LLDP_DOT3_POWER_8023AT_OFF) {
 			if (!(
-			      POKE_UINT8((
-					  (((port->p_power.powertype ==
+				    POKE_UINT8(((((port->p_power.powertype ==
 					      LLDP_DOT3_POWER_8023AT_TYPE1)?1:0) << 7) |
-					   (((port->p_power.devicetype ==
+				    (((port->p_power.devicetype ==
 					      LLDP_DOT3_POWER_PSE)?0:1) << 6) |
-					   ((port->p_power.source   %(1<< 2))<<4) |
-					   ((port->p_power.priority %(1<< 2))<<0))) &&
-			      POKE_UINT16(port->p_power.requested) &&
-			      POKE_UINT16(port->p_power.allocated)))
+				    ((port->p_power.source   %(1<< 2))<<4) |
+				    ((port->p_power.pd_4pid %(1 << 1))<<2) |
+				    ((port->p_power.priority %(1<< 2))<<0))) &&
+				    POKE_UINT16(port->p_power.requested) &&
+				    POKE_UINT16(port->p_power.allocated)))
 				goto toobig;
 		}
-		if (!(POKE_END_LLDP_TLV))
-			goto toobig;
+		if (port->p_power.type_ext != LLDP_DOT3_POWER_8023BT_OFF) {
+			if (!(
+				    POKE_UINT16(port->p_power.requested_a) &&
+				    POKE_UINT16(port->p_power.requested_b) &&
+				    POKE_UINT16(port->p_power.allocated_a) &&
+				    POKE_UINT16(port->p_power.allocated_b) &&
+				    POKE_UINT16((
+					      (port->p_power.pse_status        << 14) |
+					      (port->p_power.pd_status         << 12) |
+					      (port->p_power.pse_pairs_ext     << 10) |
+					      (port->p_power.class_a           << 7)  |
+					      (port->p_power.class_b           << 4)  |
+					      (port->p_power.class_ext         << 0))) &&
+				    POKE_UINT8(
+					      /* Adjust by -1 to enable 0 to mean no 802.3bt support */
+					      ((port->p_power.type_ext -1)     << 1)  |
+					      (port->p_power.pd_load           << 0)) &&
+				    POKE_UINT16(port->p_power.pse_max) &&
+				    /* Send 0 for autoclass and power down requests */
+				    POKE_UINT8(0) &&
+				    POKE_UINT16(0) &&
+				    POKE_UINT8(0)))
+					goto toobig;
+		}
+	if (!(POKE_END_LLDP_TLV))
+		goto toobig;
 	}
 #endif
 
@@ -492,6 +532,7 @@ end:
 	return 0;
 
 toobig:
+	log_info("lldp", "Cannot send LLDP packet for %s, Too big message", p_id);
 	free(packet);
 	return E2BIG;
 }
@@ -575,6 +616,12 @@ lldp_send(struct lldpd *global,
 	       hardware->h_ifname);			   \
 	   goto malformed;				   \
 	} } while (0)
+#define CHECK_TLV_MAX_SIZE(x, name)			   \
+	do { if (tlv_size > (x)) {			   \
+			log_warnx("lldp", name " TLV too large received on %s",	\
+	       hardware->h_ifname);			   \
+	   goto malformed;				   \
+	} } while (0)
 
 int
 lldp_decode(struct lldpd *cfg, char *frame, int s,
@@ -590,7 +637,7 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 	const char dcbx[] = LLDP_TLV_ORG_DCBX;
 	unsigned char orgid[3];
 	int length, gotend = 0, ttl_received = 0;
-	int tlv_size, tlv_type, tlv_subtype;
+	int tlv_size, tlv_type, tlv_subtype, tlv_count = 0;
 	u_int8_t *pos, *tlv;
 	char *b;
 #ifdef ENABLE_DOT1
@@ -667,6 +714,32 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 			    hardware->h_ifname);
 			goto malformed;
 		}
+		/* Check order for mandatory TLVs */
+		tlv_count++;
+		switch (tlv_type) {
+		case LLDP_TLV_CHASSIS_ID:
+			if (tlv_count != 1) {
+				log_warnx("lldp", "first TLV should be a chassis ID on %s, not %d",
+				    hardware->h_ifname, tlv_type);
+				goto malformed;
+			}
+			break;
+		case LLDP_TLV_PORT_ID:
+			if (tlv_count != 2) {
+				log_warnx("lldp", "second TLV should be a port ID on %s, not %d",
+				    hardware->h_ifname, tlv_type);
+				goto malformed;
+			}
+			break;
+		case LLDP_TLV_TTL:
+			if (tlv_count != 3) {
+				log_warnx("lldp", "third TLV should be a TTL on %s, not %d",
+				    hardware->h_ifname, tlv_type);
+				goto malformed;
+			}
+			break;
+		}
+
 		switch (tlv_type) {
 		case LLDP_TLV_END:
 			if (tlv_size != 0) {
@@ -681,7 +754,8 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 			break;
 		case LLDP_TLV_CHASSIS_ID:
 		case LLDP_TLV_PORT_ID:
-			CHECK_TLV_SIZE(2, "Port Id");
+			CHECK_TLV_SIZE(2, "Port/Chassis Id");
+			CHECK_TLV_MAX_SIZE(256, "Port/Chassis Id");
 			tlv_subtype = PEEK_UINT8;
 			if ((tlv_subtype == 0) || (tlv_subtype > 7)) {
 				log_warnx("lldp", "unknown subtype for tlv id received on %s",
@@ -696,18 +770,35 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 			}
 			PEEK_BYTES(b, tlv_size - 1);
 			if (tlv_type == LLDP_TLV_PORT_ID) {
+				if (port->p_id != NULL) {
+					log_warnx("lldp", "Port ID TLV received twice on %s",
+					    hardware->h_ifname);
+					free(b);
+					goto malformed;
+				}
 				port->p_id_subtype = tlv_subtype;
 				port->p_id = b;
 				port->p_id_len = tlv_size - 1;
 			} else {
+				if (chassis->c_id != NULL) {
+					log_warnx("lldp", "Chassis ID TLV received twice on %s",
+					    hardware->h_ifname);
+					free(b);
+					goto malformed;
+				}
 				chassis->c_id_subtype = tlv_subtype;
 				chassis->c_id = b;
 				chassis->c_id_len = tlv_size - 1;
 			}
 			break;
 		case LLDP_TLV_TTL:
+			if (ttl_received) {
+				log_warnx("lldp", "TTL TLV received twice on %s",
+				    hardware->h_ifname);
+				goto malformed;
+			}
 			CHECK_TLV_SIZE(2, "TTL");
-			chassis->c_ttl = PEEK_UINT16;
+			port->p_ttl = PEEK_UINT16;
 			ttl_received = 1;
 			break;
 		case LLDP_TLV_PORT_DESCR:
@@ -923,6 +1014,35 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 					} else
 						port->p_power.powertype =
 						    LLDP_DOT3_POWER_8023AT_OFF;
+					/* 802.3bt? */
+					if (tlv_size >= 29) {
+						port->p_power.requested_a = PEEK_UINT16;
+						port->p_power.requested_b = PEEK_UINT16;
+						port->p_power.allocated_a = PEEK_UINT16;
+						port->p_power.allocated_b = PEEK_UINT16;
+						port->p_power.pse_status = PEEK_UINT16;
+						port->p_power.pd_status =
+						    (port->p_power.pse_status & (1<<13 | 1<<12)) >> 12;
+						port->p_power.pse_pairs_ext =
+						    (port->p_power.pse_status & (1<<11 | 1<<10)) >> 10;
+						port->p_power.class_a =
+						    (port->p_power.pse_status & (1<<9 | 1<<8 | 1<<7)) >> 7;
+						port->p_power.class_b =
+						    (port->p_power.pse_status & (1<<6 | 1<<5 | 1<<4)) >> 4;
+						port->p_power.class_ext =
+						    (port->p_power.pse_status & 0xf);
+						port->p_power.pse_status =
+						    (port->p_power.pse_status & (1<<15 | 1<<14)) >> 14;
+						port->p_power.type_ext = PEEK_UINT8;
+						port->p_power.pd_load =
+						    (port->p_power.type_ext & 0x1);
+						port->p_power.type_ext =
+						    ((port->p_power.type_ext & (1<<3 | 1<<2 | 1<<1)) + 1);
+						port->p_power.pse_max = PEEK_UINT16;
+					} else {
+						port->p_power.type_ext =
+						    LLDP_DOT3_POWER_8023BT_OFF;
+					}
 					break;
 				default:
 					/* Unknown Dot3 TLV, ignore it */
@@ -1147,7 +1267,8 @@ lldp_decode(struct lldpd *cfg, char *frame, int s,
 		default:
 			log_warnx("lldp", "unknown tlv (%d) received on %s",
 			    tlv_type, hardware->h_ifname);
-			goto malformed;
+			hardware->h_rx_unrecognized_cnt++;
+			break;
 		}
 		if (pos > tlv + tlv_size) {
 			log_warnx("lldp", "BUG: already past TLV!");

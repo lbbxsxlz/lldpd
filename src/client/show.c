@@ -49,6 +49,35 @@ cmd_show_neighbors(struct lldpctl_conn_t *conn, struct writer *w,
 }
 
 /**
+ * Show interfaces.
+ *
+ * The environment will contain the following keys:
+ *  - C{ports} list of ports we want to restrict showing.
+ *  - C{hidden} if we should show hidden ports.
+ *  - C{summary} if we want to show only a summary
+ *  - C{detailed} for a detailed overview
+ */
+static int
+cmd_show_interfaces(struct lldpctl_conn_t *conn, struct writer *w,
+    struct cmd_env *env, void *arg)
+{
+	log_debug("lldpctl", "show interfaces data (%s) %s hidden interfaces",
+	    cmdenv_get(env, "summary")?"summary":
+	    cmdenv_get(env, "detailed")?"detailed":
+	    "normal", cmdenv_get(env, "hidden")?"with":"without");
+	if (cmdenv_get(env, "ports"))
+		log_debug("lldpctl", "restrict to the following ports: %s",
+		    cmdenv_get(env, "ports"));
+
+	display_local_interfaces(conn, w, env, !!cmdenv_get(env, "hidden"),
+	    cmdenv_get(env, "summary")?DISPLAY_BRIEF:
+	    cmdenv_get(env, "detailed")?DISPLAY_DETAILS:
+	    DISPLAY_NORMAL);
+
+	return 1;
+}
+
+/**
  * Show chassis.
  *
  * The environment will contain the following keys:
@@ -125,8 +154,7 @@ struct watcharg {
  * Callback for the next function to display a new neighbor.
  */
 static void
-watchcb(lldpctl_conn_t *conn,
-    lldpctl_change_t type,
+watchcb(lldpctl_change_t type,
     lldpctl_atom_t *interface,
     lldpctl_atom_t *neighbor,
     void *data)
@@ -172,7 +200,7 @@ watchcb(lldpctl_conn_t *conn,
 		break;
 	default: return;
 	}
-	display_interface(conn, w, 1, interface, neighbor,
+	display_interface(NULL, w, 1, interface, neighbor,
 	    cmdenv_get(env, "summary")?DISPLAY_BRIEF:
 	    cmdenv_get(env, "detailed")?DISPLAY_DETAILS:
 	    DISPLAY_NORMAL, protocol);
@@ -205,7 +233,7 @@ cmd_watch_neighbors(struct lldpctl_conn_t *conn, struct writer *w,
 	}
 
 	log_debug("lldpctl", "watch for neighbor changes");
-	if (lldpctl_watch_callback(conn, watchcb, &wa) < 0) {
+	if (lldpctl_watch_callback2(conn, watchcb, &wa) < 0) {
 		log_warnx("lldpctl", "unable to watch for neighbors. %s",
 		    lldpctl_last_strerror(conn));
 		return 0;
@@ -286,6 +314,12 @@ register_commands_show(struct cmd_node *root)
 		"Show neighbors data",
 		NULL, NULL, NULL);
 
+	struct cmd_node *interfaces = commands_new(
+		show,
+		"interfaces",
+		"Show interfaces data",
+		NULL, NULL, NULL);
+
 	struct cmd_node *chassis = commands_new(
 		show,
 		"chassis",
@@ -305,6 +339,15 @@ register_commands_show(struct cmd_node *root)
 	    NULL, cmd_show_neighbors, NULL);
 
 	register_common_commands(neighbors, 1);
+
+	/* Interfaces data */
+	commands_new(interfaces,
+	    NEWLINE,
+	    "Show interfaces data",
+	    NULL, cmd_show_interfaces, NULL);
+
+	cmd_restrict_ports(interfaces);
+	register_common_commands(interfaces, 0);
 
 	/* Chassis data */
 	commands_new(chassis,

@@ -47,24 +47,25 @@ struct lldpctl_conn_t {
 #define CONN_STATE_SET_WATCH_SEND	7
 #define CONN_STATE_SET_WATCH_RECV	8
 #define CONN_STATE_GET_CONFIG_SEND	9
-#define CONN_STATE_GET_CONFIG_RECV	9
-#define CONN_STATE_SET_CONFIG_SEND	10
-#define CONN_STATE_SET_CONFIG_RECV	11
-#define CONN_STATE_GET_CHASSIS_SEND	12
-#define CONN_STATE_GET_CHASSIS_RECV	13
-#define CONN_STATE_GET_DEFAULT_PORT_SEND 14
-#define CONN_STATE_GET_DEFAULT_PORT_RECV 15
+#define CONN_STATE_GET_CONFIG_RECV	10
+#define CONN_STATE_SET_CONFIG_SEND	11
+#define CONN_STATE_SET_CONFIG_RECV	12
+#define CONN_STATE_GET_CHASSIS_SEND	13
+#define CONN_STATE_GET_CHASSIS_RECV	14
+#define CONN_STATE_GET_DEFAULT_PORT_SEND 15
+#define CONN_STATE_GET_DEFAULT_PORT_RECV 16
+#define CONN_STATE_WATCHING		17
 	int state;		/* Current state */
-	char *state_data;	/* Data attached to the state. It is used to
-				 * check that we are using the same data as a
-				 * previous call until the state machine goes to
-				 * CONN_STATE_IDLE. */
-
+	/* Data attached to the state. It is used to check that we are using the
+	 * same data as a previous call until the state machine goes to
+	 * CONN_STATE_IDLE. */
+	char state_data[IFNAMSIZ + 64];
 	/* Error handling */
 	lldpctl_error_t error;	/* Last error */
 
 	/* Handling notifications */
 	lldpctl_change_callback watch_cb;
+	lldpctl_change_callback2 watch_cb2;
 	void *watch_data;
 	int watch_triggered;
 };
@@ -81,7 +82,7 @@ int _lldpctl_do_something(lldpctl_conn_t *conn,
     void *to_send, struct marshal_info *mi_send,
     void **to_recv, struct marshal_info *mi_recv);
 
-/* error.c */
+/* errors.c */
 #define SET_ERROR(conn, x)    ((conn)->error = x)
 #define RESET_ERROR(conn)     SET_ERROR((conn), LLDPCTL_NO_ERROR)
 

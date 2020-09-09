@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -38,6 +39,13 @@
 #include <netinet/if_ether.h>
 #include <pwd.h>
 #include <grp.h>
+
+#if HAVE_VFORK_H
+# include <vfork.h>
+#endif
+#if HAVE_WORKING_FORK
+# define vfork fork
+#endif
 
 static void		 usage(void);
 
@@ -90,10 +98,13 @@ usage(void)
 	fprintf(stderr, "-k       Disable advertising of kernel release, version, machine.\n");
 	fprintf(stderr, "-S descr Override the default system description.\n");
 	fprintf(stderr, "-P name  Override the default hardware platform.\n");
-	fprintf(stderr, "-m IP    Specify the IPv4 management addresses of this system.\n");
+	fprintf(stderr, "-m IP    Specify the IP management addresses of this system.\n");
 	fprintf(stderr, "-u file  Specify the Unix-domain socket used for communication with lldpctl(8).\n");
 	fprintf(stderr, "-H mode  Specify the behaviour when detecting multiple neighbors.\n");
 	fprintf(stderr, "-I iface Limit interfaces to use.\n");
+	fprintf(stderr, "-C iface Limit interfaces to use for computing chassis ID.\n");
+	fprintf(stderr, "-L path  Override path for lldpcli command.\n");
+	fprintf(stderr, "-O file  Override default configuration locations processed by lldpcli(8) at start.\n");
 #ifdef ENABLE_LLDPMED
 	fprintf(stderr, "-M class Enable emission of LLDP-MED frame. 'class' should be one of:\n");
 	fprintf(stderr, "             1 Generic Endpoint (Class I)\n");
@@ -103,6 +114,7 @@ usage(void)
 #endif
 #ifdef USE_SNMP
 	fprintf(stderr, "-x       Enable SNMP subagent.\n");
+	fprintf(stderr, "-X sock  Specify the SNMP subagent socket.\n");
 #endif
 	fprintf(stderr, "\n");
 
@@ -133,9 +145,14 @@ lldpd_get_hardware(struct lldpd *cfg, char *name, int index)
 {
 	struct lldpd_hardware *hardware;
 	TAILQ_FOREACH(hardware, &cfg->g_hardware, h_entries) {
-		if ((strcmp(hardware->h_ifname, name) == 0) &&
-		    (hardware->h_ifindex == index))
-			break;
+		if (strcmp(hardware->h_ifname, name) == 0) {
+			if (hardware->h_flags == 0) {
+				hardware->h_ifindex = index;
+				break;
+			}
+			if (hardware->h_ifindex == index)
+				break;
+		}
 	}
 	return hardware;
 }
@@ -422,10 +439,24 @@ lldpd_cleanup(struct lldpd *cfg)
 	     hardware = hardware_next) {
 		hardware_next = TAILQ_NEXT(hardware, h_entries);
 		if (!hardware->h_flags) {
-			TRACE(LLDPD_INTERFACES_DELETE(hardware->h_ifname));
-			TAILQ_REMOVE(&cfg->g_hardware, hardware, h_entries);
-			lldpd_remote_cleanup(hardware, notify_clients_deletion, 1);
-			lldpd_hardware_cleanup(cfg, hardware);
+			int m = cfg->g_config.c_perm_ifaces?
+			    pattern_match(hardware->h_ifname, cfg->g_config.c_perm_ifaces, 0):
+			    0;
+			switch (m) {
+			case 0:
+				log_debug("localchassis", "delete non-permanent interface %s",
+				    hardware->h_ifname);
+				TRACE(LLDPD_INTERFACES_DELETE(hardware->h_ifname));
+				TAILQ_REMOVE(&cfg->g_hardware, hardware, h_entries);
+				lldpd_remote_cleanup(hardware, notify_clients_deletion, 1);
+				lldpd_hardware_cleanup(cfg, hardware);
+				break;
+			case 1:
+			case 2:
+				log_debug("localchassis", "do not delete %s, permanent",
+				    hardware->h_ifname);
+				break;
+			}
 		} else {
 			lldpd_remote_cleanup(hardware, notify_clients_deletion,
 			    !(hardware->h_flags & IFF_RUNNING));
@@ -517,9 +548,11 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 	log_debug("decode", "decode a received frame on %s",
 	    hardware->h_ifname);
 
-	if (s < sizeof(struct ether_header) + 4)
+	if (s < sizeof(struct ether_header) + 4) {
 		/* Too short, just discard it */
+		hardware->h_rx_discarded_cnt++;
 		return;
+	}
 
 	/* Decapsulate VLAN frames */
 	struct ether_header eheader;
@@ -553,6 +586,7 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 				s, hardware, &chassis, &port) == -1) {
 				log_debug("decode", "function for %s protocol did not decode this frame",
 				    cfg->g_protocols[i].name);
+				hardware->h_rx_discarded_cnt++;
 				return;
 			}
 			chassis->c_protocol = port->p_protocol =
@@ -628,7 +662,14 @@ lldpd_decode(struct lldpd *cfg, char *frame, int s,
 		free(oport);
 	}
 	if (ochassis) {
-		lldpd_move_chassis(ochassis, chassis);
+		if (port->p_ttl == 0) {
+			/* Shutdown LLDPDU is special. We do not want to replace
+			 * the chassis. Free the new chassis (which is mostly empty) */
+			log_debug("decode", "received a shutdown LLDPDU");
+			lldpd_chassis_cleanup(chassis, 1);
+		} else {
+			lldpd_move_chassis(ochassis, chassis);
+		}
 		chassis = ochassis;
 	} else {
 		/* Chassis not known, add it */
@@ -939,6 +980,48 @@ lldpd_hide_all(struct lldpd *cfg)
 	}
 }
 
+/* If PD device and PSE allocated power, echo back this change. If we have
+ * several LLDP neighbors, we use the latest updated. */
+static void
+lldpd_dot3_power_pd_pse(struct lldpd_hardware *hardware)
+{
+#ifdef ENABLE_DOT3
+	struct lldpd_port *port, *selected_port = NULL;
+	/* Are we a PD device? */
+	if (hardware->h_lport.p_power.devicetype != LLDP_DOT3_POWER_PD)
+		return;
+	TAILQ_FOREACH(port, &hardware->h_rports, p_entries) {
+		if (port->p_hidden_in)
+			continue;
+
+		if (port->p_protocol != LLDPD_MODE_LLDP && port->p_protocol != LLDPD_MODE_CDPV2)
+			continue;
+
+		if (port->p_power.devicetype != LLDP_DOT3_POWER_PSE)
+			continue;
+		if (!selected_port || port->p_lastupdate > selected_port->p_lastupdate)
+			selected_port = port;
+	}
+	if (selected_port && selected_port->p_power.allocated != hardware->h_lport.p_power.allocated) {
+		log_info("receive", "for %s, PSE told us allocated is now %d instead of %d",
+		    hardware->h_ifname,
+		    selected_port->p_power.allocated,
+		    hardware->h_lport.p_power.allocated);
+		hardware->h_lport.p_power.allocated = selected_port->p_power.allocated;
+		hardware->h_lport.p_power.allocated_a = selected_port->p_power.allocated_a;
+		hardware->h_lport.p_power.allocated_b = selected_port->p_power.allocated_b;
+		levent_schedule_pdu(hardware);
+	}
+
+#ifdef ENABLE_CDP
+	if (selected_port && selected_port->p_cdp_power.management_id != hardware->h_lport.p_cdp_power.management_id) {
+		hardware->h_lport.p_cdp_power.management_id = selected_port->p_cdp_power.management_id;
+	}
+#endif
+
+#endif
+}
+
 void
 lldpd_recv(struct lldpd *cfg, struct lldpd_hardware *hardware, int fd)
 {
@@ -976,6 +1059,7 @@ lldpd_recv(struct lldpd *cfg, struct lldpd_hardware *hardware, int fd)
 	TRACE(LLDPD_FRAME_RECEIVED(hardware->h_ifname, buffer, (size_t)n));
 	lldpd_decode(cfg, buffer, n, hardware);
 	lldpd_hide_all(cfg); /* Immediatly hide */
+	lldpd_dot3_power_pd_pse(hardware);
 	lldpd_count_neighbors(cfg);
 	free(buffer);
 }
@@ -1034,6 +1118,7 @@ lldpd_send(struct lldpd_hardware *hardware)
 				    cfg->g_protocols[i].name);
 				cfg->g_protocols[i].send(cfg,
 				    hardware);
+				hardware->h_lport.p_protocol = cfg->g_protocols[i].mode;
 				sent++;
 				break;
 			}
@@ -1090,7 +1175,7 @@ lldpd_routing_enabled(struct lldpd *cfg)
 	return routing;
 }
 
-static void
+void
 lldpd_update_localchassis(struct lldpd *cfg)
 {
 	struct utsname un;
@@ -1156,11 +1241,21 @@ lldpd_update_localchassis(struct lldpd *cfg)
 	if ((LOCAL_CHASSIS(cfg)->c_cap_available & LLDP_CAP_STATION) &&
 		(LOCAL_CHASSIS(cfg)->c_cap_enabled == 0))
 		LOCAL_CHASSIS(cfg)->c_cap_enabled = LLDP_CAP_STATION;
+	else if (LOCAL_CHASSIS(cfg)->c_cap_enabled != LLDP_CAP_STATION)
+		LOCAL_CHASSIS(cfg)->c_cap_enabled &= ~LLDP_CAP_STATION;
 
 	/* Set chassis ID if needed. This is only done if chassis ID
 	   has not been set previously (with the MAC address of an
 	   interface for example)
 	*/
+	if (cfg->g_config.c_cid_string != NULL) {
+		log_debug("localchassis", "use specified chassis ID string");
+		free(LOCAL_CHASSIS(cfg)->c_id);
+		if (!(LOCAL_CHASSIS(cfg)->c_id = strdup(cfg->g_config.c_cid_string)))
+			fatal("localchassis", NULL);
+		LOCAL_CHASSIS(cfg)->c_id_len = strlen(cfg->g_config.c_cid_string);
+		LOCAL_CHASSIS(cfg)->c_id_subtype = LLDP_CHASSISID_SUBTYPE_LOCAL;
+	}
 	if (LOCAL_CHASSIS(cfg)->c_id == NULL) {
 		log_debug("localchassis", "no chassis ID is currently set, use chassis name");
 		if (!(LOCAL_CHASSIS(cfg)->c_id = strdup(LOCAL_CHASSIS(cfg)->c_name)))
@@ -1232,6 +1327,7 @@ lldpd_exit(struct lldpd *cfg)
 	lldpd_all_chassis_cleanup(cfg);
 	free(cfg->g_default_local_port);
 	free(cfg->g_config.c_platform);
+	levent_shutdown(cfg);
 }
 
 /**
@@ -1240,7 +1336,7 @@ lldpd_exit(struct lldpd *cfg)
  * @return PID of running lldpcli or -1 if error.
  */
 static pid_t
-lldpd_configure(int use_syslog, int debug, const char *path, const char *ctlname)
+lldpd_configure(int use_syslog, int debug, const char *path, const char *ctlname, const char *config_path)
 {
 	pid_t lldpcli = vfork();
 	int devnull;
@@ -1269,12 +1365,21 @@ lldpd_configure(int use_syslog, int debug, const char *path, const char *ctlname
 			dup2(devnull,   STDOUT_FILENO);
 			if (devnull > 2) close(devnull);
 
-			execl(path, "lldpcli", sdebug,
-			    "-u", ctlname,
-			    "-c", SYSCONFDIR "/lldpd.conf",
-			    "-c", SYSCONFDIR "/lldpd.d",
-			    "resume",
-			    (char *)NULL);
+			if (config_path) {
+				execl(path, "lldpcli", sdebug,
+				    "-u", ctlname,
+				    "-C", config_path,
+				    "resume",
+				    (char *)NULL);
+			} else {
+				execl(path, "lldpcli", sdebug,
+				    "-u", ctlname,
+				    "-C", SYSCONFDIR "/lldpd.conf",
+				    "-C", SYSCONFDIR "/lldpd.d",
+				    "resume",
+				    (char *)NULL);
+			}
+
 			log_warn("main", "unable to execute %s", path);
 			log_warnx("main", "configuration is incomplete, lldpd needs to be unpaused");
 		}
@@ -1325,25 +1430,6 @@ static const struct intint filters[] = {
 };
 
 #ifndef HOST_OS_OSX
-/**
- * Tell if we have been started by upstart.
- */
-static int
-lldpd_started_by_upstart()
-{
-#ifdef HOST_OS_LINUX
-	const char *upstartjob = getenv("UPSTART_JOB");
-	if (!(upstartjob && !strcmp(upstartjob, "lldpd")))
-		return 0;
-	log_debug("main", "running with upstart, don't fork but stop");
-	raise(SIGSTOP);
-	unsetenv("UPSTART_JOB");
-	return 1;
-#else
-	return 0;
-#endif
-}
-
 /**
  * Tell if we have been started by systemd.
  */
@@ -1450,7 +1536,7 @@ lldpd_main(int argc, char *argv[], char *envp[])
 	 * unless there is a very good reason. Most command-line options will
 	 * get deprecated at some point. */
 	char *popt, opts[] =
-		"H:vhkrdD:p:xX:m:u:4:6:I:C:p:M:P:S:iL:@                    ";
+	    "H:vhkrdD:p:xX:m:u:4:6:I:C:p:M:P:S:iL:O:@                    ";
 	int i, found, advertise_version = 1;
 #ifdef ENABLE_LLDPMED
 	int lldpmed = 0, noinventory = 0;
@@ -1464,6 +1550,7 @@ lldpd_main(int argc, char *argv[], char *envp[])
 	int smart = 15;
 	int receiveonly = 0, version = 0;
 	int ctl;
+	const char *config_file = NULL;
 
 #ifdef ENABLE_PRIVSEP
 	/* Non privileged user */
@@ -1609,6 +1696,13 @@ lldpd_main(int argc, char *argv[], char *envp[])
 				usage();
 			}
 			break;
+		case 'O':
+			if (config_file) {
+				fprintf(stderr, "-O can only be used once\n");
+				usage();
+			}
+			config_file = optarg;
+			break;
 		default:
 			found = 0;
 			for (i=0; protos[i].mode != 0; i++) {
@@ -1639,7 +1733,17 @@ lldpd_main(int argc, char *argv[], char *envp[])
 
 	log_init(use_syslog, debug, __progname);
 	tzset();		/* Get timezone info before chroot */
-
+	if (use_syslog && daemonize) {
+		/* So, we use syslog and we daemonize (or we are started by
+		 * systemd). No need to continue writing to stdout. */
+		int fd;
+		if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
+			dup2(fd, STDIN_FILENO);
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			if (fd > 2) close(fd);
+		}
+	}
 	log_debug("main", "lldpd " PACKAGE_VERSION " starting...");
 	version_check();
 
@@ -1694,21 +1798,13 @@ lldpd_main(int argc, char *argv[], char *envp[])
 	/* Disable SIGHUP, until handlers are installed */
 	signal(SIGHUP, SIG_IGN);
 
-	/* Configuration with lldpcli */
-	if (lldpcli) {
-		log_debug("main", "invoking lldpcli for configuration");
-		if (lldpd_configure(use_syslog, debug, lldpcli, ctlname) == -1)
-			fatal("main", "unable to spawn lldpcli");
-	}
-
-	/* Daemonization, unless started by upstart, systemd or launchd or debug */
+	/* Daemonization, unless started by systemd or launchd or debug */
 #ifndef HOST_OS_OSX
-	if (daemonize &&
-	    !lldpd_started_by_upstart() && !lldpd_started_by_systemd()) {
+	if (!lldpd_started_by_systemd() && daemonize) {
 		int pid;
 		char *spid;
-		log_debug("main", "daemonize");
-		if (daemon(0, 0) != 0)
+		log_debug("main", "going into background");
+		if (daemon(0, 1) != 0)
 			fatal("main", "failed to detach daemon");
 		if ((pid = open(pidfile,
 			    O_TRUNC | O_CREAT | O_WRONLY, 0666)) == -1)
@@ -1724,6 +1820,17 @@ lldpd_main(int argc, char *argv[], char *envp[])
 		close(pid);
 	}
 #endif
+
+	/* Configuration with lldpcli */
+	if (lldpcli) {
+		if (!config_file) {
+			log_debug("main", "invoking lldpcli for default configuration locations");
+		} else {
+			log_debug("main", "invoking lldpcli for user supplied configuration location");
+		}
+		if (lldpd_configure(use_syslog, debug, lldpcli, ctlname, config_file) == -1)
+			fatal("main", "unable to spawn lldpcli");
+	}
 
 	/* Try to read system information from /etc/os-release if possible.
 	   Fall back to lsb_release for compatibility. */
@@ -1755,8 +1862,10 @@ lldpd_main(int argc, char *argv[], char *envp[])
 	if (lldpcli)
 		cfg->g_config.c_paused = 1;
 	cfg->g_config.c_receiveonly = receiveonly;
-	cfg->g_config.c_tx_interval = LLDPD_TX_INTERVAL;
+	cfg->g_config.c_tx_interval = LLDPD_TX_INTERVAL * 1000;
 	cfg->g_config.c_tx_hold = LLDPD_TX_HOLD;
+	cfg->g_config.c_ttl = cfg->g_config.c_tx_interval * cfg->g_config.c_tx_hold;
+	cfg->g_config.c_ttl = (cfg->g_config.c_ttl + 999) / 1000;
 	cfg->g_config.c_max_neighbors = LLDPD_MAX_NEIGHBORS;
 #ifdef ENABLE_LLDPMED
 	cfg->g_config.c_enable_fast_start = enable_fast_start;
@@ -1808,9 +1917,6 @@ lldpd_main(int argc, char *argv[], char *envp[])
 	} else
 		cfg->g_config.c_noinventory = 1;
 #endif
-
-	/* Set TTL */
-	lchassis->c_ttl = cfg->g_config.c_tx_interval * cfg->g_config.c_tx_hold;
 
 	log_debug("main", "initialize protocols");
 	cfg->g_protocols = protos;

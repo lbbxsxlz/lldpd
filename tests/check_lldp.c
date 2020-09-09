@@ -46,7 +46,6 @@ check_received_port(
 #ifdef ENABLE_DOT3
 	ck_assert_int_eq(rport->p_mfs, sport->p_mfs);
 #endif
-	return;
 }
 
 static void
@@ -61,7 +60,6 @@ check_received_chassis(
 	ck_assert_str_eq(rchassis->c_descr, schassis->c_descr);
 	ck_assert_int_eq(rchassis->c_cap_available, schassis->c_cap_available);
 	ck_assert_int_eq(rchassis->c_cap_enabled, schassis->c_cap_enabled);
-	return;
 }
 
 #ifdef ENABLE_LLDPMED
@@ -103,7 +101,6 @@ check_received_port_med(
 	ck_assert_int_eq(rport->p_med_power.priority,
 		sport->p_med_power.priority);
 	ck_assert_int_eq(rport->p_med_power.val, sport->p_med_power.val);
-	return;
 }
 
 static void
@@ -118,7 +115,6 @@ check_received_chassis_med(
 	ck_assert_str_eq(rchassis->c_med_fw, schassis->c_med_fw);
 	ck_assert_str_eq(rchassis->c_med_sw, schassis->c_med_sw);
 	ck_assert_str_eq(rchassis->c_med_sn, schassis->c_med_sn);
-	return;
 }
 #endif
 
@@ -136,7 +132,6 @@ check_received_port_dot3(
 	ck_assert_int_eq(rport->p_macphy.autoneg_advertised,
 		sport->p_macphy.autoneg_advertised);
 	ck_assert_int_eq(rport->p_macphy.mau_type, sport->p_macphy.mau_type);
-	return;
 }
 #endif
 
@@ -183,6 +178,83 @@ START_TEST (test_send_rcv_basic)
 	/* verify port values */
 	check_received_port(&hardware.h_lport, nport);
 	/* verify chassis values */
+	check_received_chassis(&chassis, nchassis);
+}
+END_TEST
+
+#define ETHERTYPE_OFFSET 2 * ETHER_ADDR_LEN
+#define VLAN_TAG_SIZE 2
+START_TEST (test_send_rcv_vlan_tx)
+{
+	int n;
+	struct packet *pkt;
+	struct lldpd_chassis *nchassis = NULL;
+	struct lldpd_port *nport = NULL;
+	int vlan_id = 100;
+	int vlan_prio = 5;
+	int vlan_dei = 1;
+	unsigned int vlan_tag = 0;
+	unsigned int tmp;
+
+	/* Populate port and chassis */
+	hardware.h_lport.p_id_subtype = LLDP_PORTID_SUBTYPE_IFNAME;
+	hardware.h_lport.p_id = "FastEthernet 1/5";
+	hardware.h_lport.p_id_len = strlen(hardware.h_lport.p_id);
+	hardware.h_lport.p_descr = "Fake port description";
+	hardware.h_lport.p_mfs = 1516;
+
+	/* Assembly VLAN tag: Priority(3bits) | DEI(1bit) | VID(12bits) */
+	vlan_tag = ((vlan_prio & 0x7) << 13) |
+		   ((vlan_dei & 0x1) << 12) |
+		   (vlan_id & 0xfff);
+	hardware.h_lport.p_vlan_tx_tag = vlan_tag;
+	hardware.h_lport.p_vlan_tx_enabled = 1;
+	chassis.c_id_subtype = LLDP_CHASSISID_SUBTYPE_LLADDR;
+	chassis.c_id = macaddress;
+	chassis.c_id_len = ETHER_ADDR_LEN;
+	chassis.c_name = "First chassis";
+	chassis.c_descr = "Chassis description";
+	chassis.c_cap_available = chassis.c_cap_enabled = LLDP_CAP_ROUTER;
+
+	/* Build packet */
+	n = lldp_send(&test_lldpd, &hardware);
+	if (n != 0) {
+		fail("unable to build packet");
+		return;
+	}
+	if (TAILQ_EMPTY(&pkts)) {
+		fail("no packets sent");
+		return;
+	}
+	pkt = TAILQ_FIRST(&pkts);
+	fail_unless(TAILQ_NEXT(pkt, next) == NULL, "more than one packet sent");
+
+	/* Check ETHER_TYPE, should be VLAN */
+	memcpy(&tmp, (unsigned char*) pkt->data + ETHERTYPE_OFFSET, ETHER_TYPE_LEN);
+	ck_assert_uint_eq(ntohl(tmp)>>16, ETHERTYPE_VLAN);
+
+	/* Check VLAN tag */
+	memcpy(&tmp, (unsigned char*) pkt->data + ETHERTYPE_OFFSET + ETHER_TYPE_LEN, VLAN_TAG_SIZE);
+	ck_assert_uint_eq(ntohl(tmp)>>16, vlan_tag);
+
+	/* Remove VLAN ethertype and VLAN tag */
+	memmove((unsigned char*) pkt->data + ETHERTYPE_OFFSET,
+		/* move all after VLAN tag */
+		(unsigned char*) pkt->data + ETHERTYPE_OFFSET + ETHER_TYPE_LEN + VLAN_TAG_SIZE,
+		/* size without src and dst MAC, VLAN tag */
+		pkt->size - (ETHERTYPE_OFFSET + ETHER_TYPE_LEN + VLAN_TAG_SIZE));
+
+	/* Decode the packet without VLAN tag, calling lldp_decode() */
+	fail_unless(lldp_decode(NULL, pkt->data, pkt->size, &hardware,
+		&nchassis, &nport) != -1);
+	if (!nchassis || !nport) {
+		fail("unable to decode packet");
+		return;
+	}
+
+	/* Verify port values (VLAN information is not checked here) */
+	check_received_port(&hardware.h_lport, nport);
+	/* Verify chassis values */
 	check_received_chassis(&chassis, nchassis);
 }
 END_TEST
@@ -313,8 +385,6 @@ START_TEST (test_send_rcv_dot1_tlvs)
 
 	rpi = TAILQ_NEXT(rpi, p_entries);
 	fail_unless(rpi == NULL);
-
-	return;
 }
 END_TEST
 #endif
@@ -513,10 +583,10 @@ Link Layer Discovery Protocol
 	    LLDP_PORTID_SUBTYPE_LLADDR);
 	ck_assert_int_eq(nport->p_id_len, ETHER_ADDR_LEN);
 	fail_unless(memcmp(mac2, nport->p_id, ETHER_ADDR_LEN) == 0);
-	ck_assert_int_eq(nchassis->c_ttl, 120);
 	ck_assert_ptr_eq(nchassis->c_name, NULL);
 	ck_assert_ptr_eq(nchassis->c_descr, NULL);
 	ck_assert_ptr_eq(nport->p_descr, NULL);
+	ck_assert_int_eq(nport->p_ttl, 120);
 }
 END_TEST
 
@@ -718,7 +788,7 @@ Link Layer Discovery Protocol
 	    LLDP_PORTID_SUBTYPE_LLADDR);
 	ck_assert_int_eq(nport->p_id_len, ETHER_ADDR_LEN);
 	fail_unless(memcmp(mac1, nport->p_id, ETHER_ADDR_LEN) == 0);
-	ck_assert_int_eq(nchassis->c_ttl, 120);
+	ck_assert_int_eq(nport->p_ttl, 120);
 	ck_assert_str_eq(nchassis->c_name, "naruto.XXXXXXXXXXXXXXXXXXX");
 	ck_assert_str_eq(nchassis->c_descr,
 	    "Linux 2.6.29-2-amd64 #1 SMP Sun May 17 17:15:47 UTC 2009 x86_64");
@@ -776,6 +846,7 @@ lldp_suite(void)
 
 	tcase_add_checked_fixture(tc_send, pcap_setup, pcap_teardown);
 	tcase_add_test(tc_send, test_send_rcv_basic);
+	tcase_add_test(tc_send, test_send_rcv_vlan_tx);
 #ifdef ENABLE_DOT1
 	tcase_add_test(tc_send, test_send_rcv_dot1_tlvs);
 #endif

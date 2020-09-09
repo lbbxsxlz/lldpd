@@ -5,6 +5,7 @@ import os
 import pyroute2
 import pytest
 import signal
+import multiprocessing
 
 # All allowed namespace types
 NAMESPACE_FLAGS = dict(mnt=0x00020000,
@@ -28,6 +29,62 @@ def keep_directory():
         os.chdir(pwd)
 
 
+def mount_sys(target="/sys"):
+    flags = [2 | 4 | 8] # MS_NOSUID | MS_NODEV | MS_NOEXEC
+    flags.append(1 << 18)   # MS_PRIVATE
+    flags.append(1 << 19)   # MS_SLAVE
+    for fl in flags:
+        ret = libc.mount(b"none",
+                         target.encode('ascii'),
+                         b"sysfs",
+                         fl,
+                         None)
+        if ret == -1:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+
+
+def mount_tmpfs(target, private=False):
+    flags = [0]
+    if private:
+        flags.append(1 << 18)   # MS_PRIVATE
+        flags.append(1 << 19)   # MS_SLAVE
+    for fl in flags:
+        ret = libc.mount(b"none",
+                         target.encode('ascii'),
+                         b"tmpfs",
+                         fl,
+                         None)
+        if ret == -1:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+
+
+def _mount_proc(target):
+    flags = [2 | 4 | 8] # MS_NOSUID | MS_NODEV | MS_NOEXEC
+    flags.append(1 << 18)   # MS_PRIVATE
+    flags.append(1 << 19)   # MS_SLAVE
+    for fl in flags:
+        ret = libc.mount(b"proc",
+                         target.encode('ascii'),
+                         b"proc",
+                         fl,
+                         None)
+        if ret == -1:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+
+
+def mount_proc(target="/proc"):
+    # We need to be sure /proc is correct. We do that in another
+    # process as this doesn't play well with setns().
+    if not os.path.isdir(target):
+        os.mkdir(target)
+    p = multiprocessing.Process(target=_mount_proc, args=(target,))
+    p.start()
+    p.join()
+
+
 class Namespace(object):
     """Combine several namespaces into one.
 
@@ -37,6 +94,7 @@ class Namespace(object):
     """
 
     def __init__(self, *namespaces):
+        self.next = []
         self.namespaces = namespaces
         for ns in namespaces:
             assert ns in NAMESPACE_FLAGS
@@ -81,7 +139,16 @@ class Namespace(object):
         os.close(self.pipe[0])
         if 'pid' not in namespaces:
             os.close(self.pipe[1])
+            self.pipe = None
             os.waitpid(pid, 0)
+
+    def __del__(self):
+        for fd in self.next:
+            os.close(fd)
+        for fd in self.previous:
+            os.close(fd)
+        if self.pipe is not None:
+            os.close(self.pipe[1])
 
     def child(self):
         """Cloned child.
@@ -154,17 +221,26 @@ class NamespaceFactory(object):
 
     """
 
-    def __init__(self):
+    def __init__(self, tmpdir):
         self.namespaces = {}
+        self.tmpdir = tmpdir
 
     def __call__(self, ns):
         """Return a namespace. Create it if it doesn't exist."""
         if ns in self.namespaces:
             return self.namespaces[ns]
+
         self.namespaces[ns] = Namespace('ipc', 'net', 'mnt', 'uts')
+        with self.namespaces[ns]:
+            mount_proc()
+            mount_sys()
+            # Also setup the "namespace-dependant" directory
+            self.tmpdir.join("ns").ensure(dir=True)
+            mount_tmpfs(str(self.tmpdir.join("ns")), private=True)
+
         return self.namespaces[ns]
 
 
 @pytest.fixture
-def namespaces():
-    return NamespaceFactory()
+def namespaces(tmpdir):
+    return NamespaceFactory(tmpdir)

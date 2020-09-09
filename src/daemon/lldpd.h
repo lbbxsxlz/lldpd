@@ -37,24 +37,6 @@
 #include <netinet/in.h>
 #include <sys/un.h>
 
-#ifdef HOST_OS_LINUX
-# if defined(__clang__)
-#  pragma clang diagnostic push
-#  pragma clang diagnostic ignored "-Wdocumentation"
-# endif
-# include <linux/ethtool.h>
-# if defined(__clang__)
-#  pragma clang diagnostic pop
-# endif
-#endif
-
-#if HAVE_VFORK_H
-# include <vfork.h>
-#endif
-#if HAVE_WORKING_FORK
-# define vfork fork
-#endif
-
 #include "lldp-tlv.h"
 #if defined (ENABLE_CDP) || defined (ENABLE_FDP)
 #  include "protocols/cdp.h"
@@ -85,7 +67,7 @@ struct event_base;
 #define LLDPD_TX_HOLD          4
 #define LLDPD_TTL              LLDPD_TX_INTERVAL * LLDPD_TX_HOLD
 #define LLDPD_TX_MSGDELAY	1
-#define LLDPD_MAX_NEIGHBORS	4
+#define LLDPD_MAX_NEIGHBORS	32
 #define LLDPD_FAST_TX_INTERVAL	1
 #define LLDPD_FAST_INIT	4
 
@@ -125,6 +107,7 @@ void	 lldpd_send(struct lldpd_hardware *);
 void	 lldpd_loop(struct lldpd *);
 int	 lldpd_main(int, char **, char **);
 void	 lldpd_update_localports(struct lldpd *);
+void	 lldpd_update_localchassis(struct lldpd *);
 void	 lldpd_cleanup(struct lldpd *);
 
 /* frame.c */
@@ -132,6 +115,7 @@ u_int16_t frame_checksum(const u_int8_t *, int, int);
 
 /* event.c */
 void	 levent_loop(struct lldpd *);
+void	 levent_shutdown(struct lldpd *);
 void	 levent_hardware_init(struct lldpd_hardware *);
 void	 levent_hardware_add_fd(struct lldpd_hardware *, int);
 void	 levent_hardware_release(struct lldpd_hardware *);
@@ -143,6 +127,9 @@ void	 levent_schedule_pdu(struct lldpd_hardware *);
 void	 levent_schedule_cleanup(struct lldpd *);
 int	 levent_make_socket_nonblocking(int);
 int	 levent_make_socket_blocking(int);
+#ifdef HOST_OS_LINUX
+void	 levent_recv_error(int, const char*);
+#endif
 
 /* lldp.c */
 int	 lldp_send_shutdown(PROTO_SEND_SIG);
@@ -213,13 +200,9 @@ char   	*priv_gethostname(void);
 #ifdef HOST_OS_LINUX
 int    	 priv_open(char*);
 void	 asroot_open(void);
-int    	 priv_ethtool(char*, struct ethtool_cmd*);
-# ifdef ENABLE_OLDIES
-void	 asroot_ethtool(void);
-# endif
 #endif
-int    	 priv_iface_init(int, char *);
-int	 asroot_iface_init_os(int, char *, int *);
+int    	 priv_iface_init(int, char *, int);
+int	 asroot_iface_init_os(int, char *, int *, int);
 int	 priv_iface_multicast(const char *, const u_int8_t *, int);
 int	 priv_iface_description(const char *, const char *);
 int	 asroot_iface_description_os(const char *, const char *);
@@ -232,7 +215,6 @@ enum priv_cmd {
 	PRIV_DELETE_CTL_SOCKET,
 	PRIV_GET_HOSTNAME,
 	PRIV_OPEN,
-	PRIV_ETHTOOL,
 	PRIV_IFACE_INIT,
 	PRIV_IFACE_MULTICAST,
 	PRIV_IFACE_DESCRIPTION,
@@ -280,12 +262,13 @@ void	 send_fd(enum priv_context, int);
                 (ether dst 00:e0:2b:00:00:00)"
 */
 
+#define ETH_P_LLDP 0x88cc
 #define LLDPD_FILTER_F				\
 	{ 0x30, 0, 0, 0x00000000 },		\
 	{ 0x54, 0, 0, 0x00000001 },		\
 	{ 0x15, 0, 16, 0x00000001 },		\
 	{ 0x28, 0, 0, 0x0000000c },		\
-	{ 0x15, 0, 6, 0x000088cc },		\
+	{ 0x15, 0, 6, ETH_P_LLDP },		\
 	{ 0x20, 0, 0, 0x00000002 },		\
 	{ 0x15, 2, 0, 0xc200000e },		\
 	{ 0x15, 1, 0, 0xc2000003 },		\
@@ -315,11 +298,15 @@ void     interfaces_update(struct lldpd *);
 
 /* interfaces.c */
 /* An interface cannot be both physical and (bridge or bond or vlan) */
-#define IFACE_PHYSICAL_T (1 << 0) /* Physical interface */
-#define IFACE_BRIDGE_T   (1 << 1) /* Bridge interface */
-#define IFACE_BOND_T     (1 << 2) /* Bond interface */
-#define IFACE_VLAN_T     (1 << 3) /* VLAN interface */
-#define IFACE_WIRELESS_T (1 << 4) /* Wireless interface */
+#define IFACE_PHYSICAL_T    (1 << 0) /* Physical interface */
+#define IFACE_BRIDGE_T      (1 << 1) /* Bridge interface */
+#define IFACE_BOND_T        (1 << 2) /* Bond interface */
+#define IFACE_VLAN_T        (1 << 3) /* VLAN interface */
+#define IFACE_WIRELESS_T    (1 << 4) /* Wireless interface */
+#define IFACE_BRIDGE_VLAN_T (1 << 5) /* Bridge-aware VLAN interface */
+
+#define MAX_VLAN 4096
+#define VLAN_BITMAP_LEN (MAX_VLAN / 32)
 struct interfaces_device {
 	TAILQ_ENTRY(interfaces_device) next;
 	int   ignore;		/* Ignore this interface */
@@ -327,11 +314,12 @@ struct interfaces_device {
 	char *name;		/* Name */
 	char *alias;		/* Alias */
 	char *address;		/* MAC address */
-	char *driver;		/* Driver (for whitelisting purpose) */
+	char *driver;		/* Driver */
 	int   flags;		/* Flags (IFF_*) */
 	int   mtu;		/* MTU */
 	int   type;		/* Type (see IFACE_*_T) */
-	int   vlanid;		/* If a VLAN, what is the VLAN ID? */
+	uint32_t vlan_bmap[VLAN_BITMAP_LEN];	/* If a VLAN, what are the VLAN ID? */
+	int   pvid;		/* If a VLAN, what is the default VLAN? */
 	struct interfaces_device *lower; /* Lower interface (for a VLAN for example) */
 	struct interfaces_device *upper; /* Upper interface (for a bridge or a bond) */
 
@@ -365,7 +353,7 @@ struct interfaces_device* interfaces_nametointerface(
 
 void interfaces_helper_promisc(struct lldpd *,
     struct lldpd_hardware *);
-void interfaces_helper_whitelist(struct lldpd *,
+void interfaces_helper_allowlist(struct lldpd *,
     struct interfaces_device_list *);
 void interfaces_helper_chassis(struct lldpd *,
     struct interfaces_device_list *);
@@ -379,7 +367,8 @@ void interfaces_helper_port_name_desc(struct lldpd *,
     struct lldpd_hardware *,
     struct interfaces_device *);
 void interfaces_helper_mgmt(struct lldpd *,
-    struct interfaces_address_list *);
+    struct interfaces_address_list *,
+    struct interfaces_device_list *);
 #ifdef ENABLE_DOT1
 void interfaces_helper_vlan(struct lldpd *,
     struct interfaces_device_list *);
@@ -400,11 +389,17 @@ struct lldpd_netlink;
 #endif
 
 #ifndef HOST_OS_LINUX
+/* interfaces-bpf.c */
 int ifbpf_phys_init(struct lldpd *, struct lldpd_hardware *);
 #endif
 
 /* pattern.c */
 int pattern_match(char *, char *, int);
+
+/* bitmap.c */
+void bitmap_set(uint32_t *bmap, uint16_t vlan_id);
+int bitmap_isempty(uint32_t *bmap);
+unsigned int bitmap_numbits(uint32_t *bmap);
 
 struct lldpd {
 	int			 g_sock;

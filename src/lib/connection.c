@@ -114,6 +114,7 @@ lldpctl_new_name(const char *ctlname, lldpctl_send_callback send, lldpctl_recv_c
 	}
 	if (!send && !recv) {
 		if ((data = malloc(sizeof(struct lldpctl_conn_sync_t))) == NULL) {
+			free(conn->ctlname);
 			free(conn);
 			return NULL;
 		}
@@ -195,7 +196,7 @@ check_for_notification(lldpctl_conn_t *conn)
 	change = p;
 
 	/* We have a notification, call the callback */
-	if (conn->watch_cb) {
+	if (conn->watch_cb || conn->watch_cb2) {
 		switch (change->state) {
 		case NEIGHBOR_CHANGE_DELETED: type = lldpctl_c_deleted; break;
 		case NEIGHBOR_CHANGE_ADDED: type = lldpctl_c_added; break;
@@ -211,7 +212,10 @@ check_for_notification(lldpctl_conn_t *conn)
 		neighbor = _lldpctl_new_atom(conn, atom_port, 0,
 		    NULL, change->neighbor, NULL);
 		if (neighbor == NULL) goto end;
-		conn->watch_cb(conn, type, interface, neighbor, conn->watch_data);
+		if (conn->watch_cb)
+			conn->watch_cb(conn, type, interface, neighbor, conn->watch_data);
+		else
+			conn->watch_cb2(type, interface, neighbor, conn->watch_data);
 		conn->watch_triggered = 1;
 		goto end;
 	}
@@ -253,15 +257,16 @@ lldpctl_recv(lldpctl_conn_t *conn, const uint8_t *data, size_t length)
 	memcpy(conn->input_buffer + conn->input_buffer_len, data, length);
 	conn->input_buffer_len += length;
 
-	/* Is it a notification? */
-	check_for_notification(conn);
+	/* Read all notifications */
+	while(!check_for_notification(conn));
 
 	RESET_ERROR(conn);
 
 	return conn->input_buffer_len;
 }
 
-int lldpctl_process_conn_buffer(lldpctl_conn_t *conn)
+int
+lldpctl_process_conn_buffer(lldpctl_conn_t *conn)
 {
 	int rc;
 

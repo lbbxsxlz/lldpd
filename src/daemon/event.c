@@ -241,6 +241,18 @@ levent_ctl_free_client(struct lldpd_one_client *client)
 	}
 }
 
+static void
+levent_ctl_close_clients()
+{
+	struct lldpd_one_client *client, *client_next;
+	for (client = TAILQ_FIRST(&lldpd_clients);
+	     client;
+	     client = client_next) {
+		client_next = TAILQ_NEXT(client, next);
+		levent_ctl_free_client(client);
+	}
+}
+
 static ssize_t
 levent_ctl_send(struct lldpd_one_client *client, int type, void *data, size_t len)
 {
@@ -464,11 +476,17 @@ static void
 levent_update_and_send(evutil_socket_t fd, short what, void *arg)
 {
 	struct lldpd *cfg = arg;
-	struct timeval tv = { cfg->g_config.c_tx_interval, 0 };
+	struct timeval tv;
+	long interval_ms = cfg->g_config.c_tx_interval;
+
 	(void)fd; (void)what;
 	lldpd_loop(cfg);
 	if (cfg->g_iface_event != NULL)
-		tv.tv_sec *= 20;
+		interval_ms *= 20;
+	if (interval_ms < 30000)
+		interval_ms = 30000;
+	tv.tv_sec = interval_ms / 1000;
+	tv.tv_usec = (interval_ms % 1000) * 1000;
 	event_add(cfg->g_main_loop, &tv);
 }
 
@@ -585,6 +603,18 @@ levent_loop(struct lldpd *cfg)
 		agent_shutdown();
 #endif /* USE_SNMP */
 
+	levent_ctl_close_clients();
+}
+
+/* Release libevent resources */
+void
+levent_shutdown(struct lldpd *cfg)
+{
+	if (cfg->g_iface_event)
+		event_free(cfg->g_iface_event);
+	if (cfg->g_cleanup_timer)
+		event_free(cfg->g_cleanup_timer);
+	event_base_free(cfg->g_base);
 }
 
 static void
@@ -732,8 +762,7 @@ levent_iface_subscribe(struct lldpd *cfg, int socket)
 {
 	log_debug("event", "subscribe to interface changes from socket %d",
 	    socket);
-	if (cfg->g_iface_cb == NULL)
-		levent_make_socket_nonblocking(socket);
+	levent_make_socket_nonblocking(socket);
 	cfg->g_iface_event = event_new(cfg->g_base, socket,
 	    EV_READ | EV_PERSIST, levent_iface_recv, cfg);
 	if (cfg->g_iface_event == NULL) {
@@ -773,23 +802,23 @@ levent_schedule_cleanup(struct lldpd *cfg)
 	}
 
 	/* Compute the next TTL event */
-	struct timeval tv = { LOCAL_CHASSIS(cfg)->c_ttl, 0 };
+	struct timeval tv = { cfg->g_config.c_ttl, 0 };
 	time_t now = time(NULL);
 	time_t next;
 	struct lldpd_hardware *hardware;
 	struct lldpd_port *port;
 	TAILQ_FOREACH(hardware, &cfg->g_hardware, h_entries) {
 		TAILQ_FOREACH(port, &hardware->h_rports, p_entries) {
-			if (now >= port->p_lastupdate + port->p_chassis->c_ttl) {
+			if (now >= port->p_lastupdate + port->p_ttl) {
 				tv.tv_sec = 0;
 				log_debug("event", "immediate cleanup on port %s (%lld, %d, %lld)",
 				    hardware->h_ifname,
 				    (long long)now,
-				    port->p_chassis->c_ttl,
+				    port->p_ttl,
 				    (long long)port->p_lastupdate);
 				break;
 			}
-			next = port->p_chassis->c_ttl - (now - port->p_lastupdate);
+			next = port->p_ttl - (now - port->p_lastupdate);
 			if (next < tv.tv_sec)
 				tv.tv_sec = next;
 		}
@@ -799,7 +828,7 @@ levent_schedule_cleanup(struct lldpd *cfg)
 	    (long)tv.tv_sec);
 	if (event_add(cfg->g_cleanup_timer, &tv) == -1) {
 		log_warnx("event",
-		    "unable to schedula cleanup task");
+		    "unable to schedule cleanup task");
 		event_free(cfg->g_cleanup_timer);
 		cfg->g_cleanup_timer = NULL;
 		return;
@@ -821,10 +850,12 @@ levent_send_pdu(evutil_socket_t fd, short what, void *arg)
 		hardware->h_tx_fast--;
 
 	if (hardware->h_tx_fast > 0)
-		tx_interval = hardware->h_cfg->g_config.c_tx_fast_interval;
+		tx_interval = hardware->h_cfg->g_config.c_tx_fast_interval * 1000;
 #endif
 
-	struct timeval tv = { tx_interval, 0 };
+	struct timeval tv;
+	tv.tv_sec = tx_interval / 1000;
+	tv.tv_usec = (tx_interval % 1000) * 1000;
 	if (event_add(hardware->h_timer, &tv) == -1) {
 		log_warnx("event", "unable to re-register timer event for port %s",
 		    hardware->h_ifname);
@@ -890,3 +921,29 @@ levent_make_socket_blocking(int fd)
 	}
 	return 0;
 }
+
+#ifdef HOST_OS_LINUX
+/* Receive and log error from a socket when there is suspicion of an error. */
+void
+levent_recv_error(int fd, const char *source)
+{
+	do {
+		ssize_t n;
+		char buf[1024] = {};
+		struct msghdr msg = {
+			.msg_control = buf,
+			.msg_controllen = sizeof(buf)
+		};
+		if ((n = recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT)) <= 0) {
+			return;
+		}
+		struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+		if (cmsg == NULL)
+			log_warnx("event", "received unknown error on %s",
+			    source);
+		else
+			log_warnx("event", "received error (level=%d/type=%d) on %s",
+			    cmsg->cmsg_level, cmsg->cmsg_type, source);
+	} while (1);
+}
+#endif

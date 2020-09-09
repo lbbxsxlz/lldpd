@@ -20,6 +20,7 @@ liblldpd_la_SOURCES  = \
 	interfaces.c \
 	event.c lldpd.c \
 	pattern.c \
+	bitmap.c \
 	probes.d trace.h \
 	protocols/lldp.c \
 	protocols/cdp.c \
@@ -28,16 +29,16 @@ liblldpd_la_SOURCES  = \
 	protocols/sonmp.h \
 	protocols/edp.c \
 	protocols/edp.h
-liblldpd_la_CFLAGS   = $(AM_CFLAGS) @LIBEVENT_CFLAGS@
+liblldpd_la_CFLAGS   = $(AM_CFLAGS) @libevent_CFLAGS@ @libcap_CFLAGS@
 liblldpd_la_CPPFLAGS = $(AM_CPPFLAGS) -DSYSCONFDIR='"$(sysconfdir)"' -DLLDPCLI_PATH='"$(sbindir)/lldpcli"'
 liblldpd_la_LIBADD   = \
 	$(top_builddir)/src/libcommon-daemon-client.la \
-	$(top_builddir)/src/libcommon-daemon-lib.la @LIBEVENT_LIBS@
+	$(top_builddir)/src/libcommon-daemon-lib.la @libevent_LIBS@ @libcap_LIBS@
 
 ## lldpd
 lldpd_SOURCES = main.c
 lldpd_LDFLAGS = $(AM_LDFLAGS) $(LLDP_BIN_LDFLAGS)
-lldpd_LDADD   = liblldpd.la @LIBEVENT_LDFLAGS@
+lldpd_LDADD   = liblldpd.la @libevent_LDFLAGS@
 
 if HOST_OS_LINUX
 liblldpd_la_SOURCES += \
@@ -100,34 +101,39 @@ liblldpd_la_SOURCES += \
 	priv-bsd.c
 endif
 
-# Add SNMP support if needed
-if USE_SNMP
-liblldpd_la_SOURCES += agent.c agent_priv.c agent.h
-liblldpd_la_CFLAGS  += @NETSNMP_CFLAGS@
-lldpd_LDADD         += @NETSNMP_LIBS@
-endif
-
 # seccomp support
 if USE_SECCOMP
 BUILT_SOURCES += syscall-names.h
-CLEANFILES    += syscall-names.h
+CLEANFILES    += syscall-names.h syscall-names.h.tmp
 syscall-names.h:
 	$(AM_V_GEN)
-	$(AM_V_at)echo "static const char *syscall_names[] = {" > $@ ;\
-	echo "#include <sys/syscall.h>" | cpp -dM | grep '^#define __NR_' | \
+	$(AM_V_at)echo "#include <sys/syscall.h>" | $(CPP) -dM - > $@.tmp ;\
+	echo "static const char *syscall_names[] = {" > $@ ;\
+	grep '^#define __NR_' $@.tmp | \
 		LC_ALL=C sed -r -n -e 's/^\#define[ \t]+__NR_([a-z0-9_]+)[ \t]+([0-9]+)(.*)/ [\2] = "\1",/p' >> $@ ;\
-	echo "};" >> $@
+	echo "};" >> $@ ;\
+	rm $@.tmp
 nodist_liblldpd_la_SOURCES += syscall-names.h
 liblldpd_la_SOURCES += priv-seccomp.c
-liblldpd_la_CFLAGS  += @SECCOMP_CFLAGS@
-liblldpd_la_LIBADD  += @SECCOMP_LIBS@
+liblldpd_la_CFLAGS  += @libseccomp_CFLAGS@
+liblldpd_la_LIBADD  += @libseccomp_LIBS@
+endif
+
+# Add SNMP support if needed
+if USE_SNMP
+noinst_LTLIBRARIES       += liblldpd-snmp.la
+liblldpd_snmp_la_SOURCES  = agent.c agent_priv.c agent.h
+liblldpd_snmp_la_CFLAGS   = $(liblldpd_la_CFLAGS) @NETSNMP_CFLAGS@
+liblldpd_snmp_la_CPPFLAGS = $(liblldpd_la_CPPFLAGS)
+liblldpd_la_LIBADD       += liblldpd-snmp.la
+lldpd_LDADD              += @NETSNMP_LIBS@
 endif
 
 ## Systemtap/DTrace
 EXTRA_DIST = dtrace2systemtap.awk
 if ENABLE_SYSTEMTAP
 BUILT_SOURCES += probes.h
-CLEANFILES    += probes.h
+CLEANFILES    += probes.h lldpd.stp
 probes.h: probes.d
 	$(AM_V_GEN)
 	$(AM_V_at)$(DTRACE) -C -h -s $< -o $@

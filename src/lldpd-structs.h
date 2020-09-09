@@ -125,8 +125,31 @@ struct lldpd_dot3_power {
 	u_int8_t		priority;
 	u_int16_t		requested;
 	u_int16_t		allocated;
+
+	/* For 802.3BT */
+	u_int8_t		pd_4pid;
+	u_int16_t		requested_a;
+	u_int16_t		requested_b;
+	u_int16_t		allocated_a;
+	u_int16_t		allocated_b;
+	u_int16_t		pse_status;
+	u_int8_t		pd_status;
+	u_int8_t		pse_pairs_ext;
+	u_int8_t		class_a;
+	u_int8_t		class_b;
+	u_int8_t		class_ext;
+	u_int8_t		type_ext;
+	u_int8_t		pd_load;
+	u_int16_t		pse_max;
 };
 MARSHAL(lldpd_dot3_power);
+#endif
+
+#if defined (ENABLE_CDP) || defined (ENABLE_FDP)
+struct cdpv2_power {
+	u_int16_t request_id;
+	u_int16_t management_id;
+};
 #endif
 
 enum {
@@ -135,17 +158,6 @@ enum {
 	LLDPD_AF_IPV6,
 	LLDPD_AF_LAST
 };
-
-inline static int
-lldpd_af(int af)
-{
-	switch (af) {
-	case LLDPD_AF_IPV4: return AF_INET;
-	case LLDPD_AF_IPV6: return AF_INET6;
-	case LLDPD_AF_LAST: return AF_MAX;
-	default: return AF_UNSPEC;
-	}
-}
 
 #define LLDPD_MGMT_MAXADDRSIZE	16 /* sizeof(struct in6_addr) */
 union lldpd_address {
@@ -177,8 +189,6 @@ struct lldpd_chassis {
 
 	u_int16_t		 c_cap_available;
 	u_int16_t		 c_cap_enabled;
-
-	u_int16_t		 c_ttl;
 
 	TAILQ_HEAD(, lldpd_mgmt) c_mgmt;
 
@@ -245,12 +255,14 @@ struct lldpd_port {
 	struct lldpd_chassis	*p_chassis;    /* Attached chassis */
 	time_t			 p_lastchange; /* Time of last change of values */
 	time_t			 p_lastupdate; /* Time of last update received */
+	time_t			 p_lastremove;	/* Time of last removal of a remote port. Used for local ports only
+						 * Used for deciding lldpStatsRemTablesLastChangeTime */
 	struct lldpd_frame	*p_lastframe;  /* Frame received during last update */
 	u_int8_t		 p_protocol;   /* Protocol used to get this port */
 	u_int8_t		 p_hidden_in:1; /* Considered as hidden for reception */
-	u_int8_t		 p_hidden_out:2; /* Considered as hidden for emission */
-	u_int8_t		 p_disable_rx:3; /* Should RX be disabled for this port? */
-	u_int8_t		 p_disable_tx:4; /* Should TX be disabled for this port? */
+	u_int8_t		 p_hidden_out:1; /* Considered as hidden for emission */
+	u_int8_t		 p_disable_rx:1; /* Should RX be disabled for this port? */
+	u_int8_t		 p_disable_tx:1; /* Should TX be disabled for this port? */
 	/* Important: all fields that should be ignored to check if a port has
 	 * been changed should be before this mark. */
 #define LLDPD_PORT_START_MARKER (offsetof(struct lldpd_port, _p_hardware_flags))
@@ -261,6 +273,9 @@ struct lldpd_port {
 	char			*p_descr;
 	int			 p_descr_force; /* Description has been forced by user */
 	u_int16_t		 p_mfs;
+	u_int16_t		 p_ttl; /* TTL for remote port */
+	int			 p_vlan_tx_tag;
+	int			 p_vlan_tx_enabled;
 
 #ifdef ENABLE_DOT3
 	/* Dot3 stuff */
@@ -274,6 +289,10 @@ struct lldpd_port {
 	struct lldpd_med_policy	 p_med_policy[LLDP_MED_APPTYPE_LAST];
 	struct lldpd_med_loc	 p_med_location[LLDP_MED_LOCFORMAT_LAST];
 	struct lldpd_med_power	 p_med_power;
+#endif
+
+#if defined (ENABLE_CDP) || defined (ENABLE_FDP)
+	struct cdpv2_power p_cdp_power;
 #endif
 
 #ifdef ENABLE_DOT1
@@ -324,6 +343,8 @@ struct lldpd_port_set {
 	char *local_id;
 	char *local_descr;
 	int rxtx;
+	int vlan_tx_tag;
+	int vlan_tx_enabled;
 #ifdef ENABLE_LLDPMED
 	struct lldpd_med_policy *med_policy;
 	struct lldpd_med_loc    *med_location;
@@ -371,14 +392,17 @@ MARSHAL_END(lldpd_port_set);
 
 struct lldpd_config {
 	int c_paused;	        /* lldpd is paused */
-	int c_tx_interval;	/* Transmit interval */
+	int c_tx_interval;	/* Transmit interval (in ms) */
+	int c_ttl;		/* TTL */
 	int c_smart;		/* Bitmask for smart configuration (see SMART_*) */
 	int c_receiveonly;	/* Receive only mode */
 	int c_max_neighbors;	/* Maximum number of neighbors (per protocol) */
 
 	char *c_mgmt_pattern;	/* Pattern to match a management address */
 	char *c_cid_pattern;	/* Pattern to match interfaces to use for chassis ID */
+	char *c_cid_string;     /* User defined string for chassis ID */
 	char *c_iface_pattern;	/* Pattern to match interfaces to use */
+	char *c_perm_ifaces;	/* Pattern to match interfaces to keep */
 
 	char *c_platform;	/* Override platform description (for CDP) */
 	char *c_description;	/* Override chassis description */
@@ -404,7 +428,9 @@ struct lldpd_config {
 MARSHAL_BEGIN(lldpd_config)
 MARSHAL_STR(lldpd_config, c_mgmt_pattern)
 MARSHAL_STR(lldpd_config, c_cid_pattern)
+MARSHAL_STR(lldpd_config, c_cid_string)
 MARSHAL_STR(lldpd_config, c_iface_pattern)
+MARSHAL_STR(lldpd_config, c_perm_ifaces)
 MARSHAL_STR(lldpd_config, c_hostname)
 MARSHAL_STR(lldpd_config, c_platform)
 MARSHAL_STR(lldpd_config, c_description)

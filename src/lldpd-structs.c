@@ -73,6 +73,7 @@ lldpd_vlan_cleanup(struct lldpd_port *port)
 		free(vlan);
 	}
 	TAILQ_INIT(&port->p_vlans);
+	port->p_pvid = 0;
 }
 
 void
@@ -174,9 +175,8 @@ lldpd_remote_cleanup(struct lldpd_hardware *hardware,
 		port_next = TAILQ_NEXT(port, p_entries);
 		del = all;
 		if (!all && expire &&
-		    (now >= port->p_lastupdate + port->p_chassis->c_ttl)) {
-			hardware->h_ageout_cnt++;
-			hardware->h_delete_cnt++;
+		    (now >= port->p_lastupdate + port->p_ttl)) {
+			if (port->p_ttl > 0) hardware->h_ageout_cnt++;
 			del = 1;
 		}
 		if (del) {
@@ -186,6 +186,10 @@ lldpd_remote_cleanup(struct lldpd_hardware *hardware,
 			 * real list. It is only needed to be called when we
 			 * don't delete the entire list. */
 			if (!all) TAILQ_REMOVE(&hardware->h_rports, port, p_entries);
+
+			hardware->h_delete_cnt++;
+			/* Register last removal to be able to report lldpStatsRemTablesLastChangeTime */
+			hardware->h_lport.p_lastremove = time(NULL);
 			lldpd_port_cleanup(port, 1);
 			free(port);
 		}
@@ -233,7 +237,9 @@ lldpd_config_cleanup(struct lldpd_config *config)
 	log_debug("alloc", "general configuration cleanup");
 	free(config->c_mgmt_pattern);
 	free(config->c_cid_pattern);
+	free(config->c_cid_string);
 	free(config->c_iface_pattern);
+	free(config->c_perm_ifaces);
 	free(config->c_hostname);
 	free(config->c_platform);
 	free(config->c_description);

@@ -26,7 +26,7 @@ The following OS are supported:
 
  * FreeBSD
  * GNU/Linux
- * OS X
+ * macOS
  * NetBSD
  * OpenBSD
  * Solaris
@@ -38,11 +38,13 @@ transmit-only agent.
 Installation
 ------------
 
-For general instructions
-[see the website](http://vincentbernat.github.io/lldpd/installation.html).
+For general instructions [prefer the
+website](http://vincentbernat.github.io/lldpd/installation.html),
+including building from released tarballs.
 
-To compile lldpd from sources, use the following:
+To compile lldpd from Git, use the following commands:
 
+    ./autogen.sh
     ./configure
     make
     sudo make install
@@ -60,33 +62,33 @@ syslog, copy `/etc/locatime` into the chroot.
 line. If you don't want to run it as root, just install it setuid or
 setgid `_lldpd`.
 
-Installation (OS X)
+Installation (macOS)
 -----------------------
 
-The same procedure as above applies for OS X. However, there are
+The same procedure as above applies for macOS. However, there are
 simpler alternatives:
 
- 1. Use [Homebrew](http://mxcl.github.io/homebrew/):
+ 1. Use [Homebrew](https://brew.sh):
 
         brew install lldpd
         # Or, for the latest version:
         brew install https://raw.github.com/vincentbernat/lldpd/master/osx/lldpd.rb
 
- 2. Build an OS X installer package which should work on the same
-    version of OS X:
+ 2. Build an macOS installer package which should work on the same
+    version of macOS:
  
         mkdir build && cd build
         ../configure --prefix=/usr/local --localstatedir=/var --sysconfdir=/private/etc --with-embedded-libevent \
-            --without-json --without-snmp
+            --without-snmp
         make -C osx pkg
 
-    If you want to compile for an older version of OS X, you need
+    If you want to compile for an older version of macOS, you need
     to find the right SDK and issues commands like those:
 
         SDK=/Developer/SDKs/MacOSX10.6.sdk
         mkdir build && cd build
         ../configure --prefix=/usr/local --localstatedir=/var --sysconfdir=/private/etc --with-embedded-libevent \
-           --without-json --without-snmp \
+           --without-snmp \
            CFLAGS="-mmacosx-version-min=10.6 -isysroot $SDK" \
            LDFLAGS="-mmacosx-version-min=10.6 -isysroot $SDK"
         make -C osx pkg
@@ -97,7 +99,7 @@ simpler alternatives:
 
         mkdir build && cd build
         ../configure --prefix=/usr/local --localstatedir=/var --sysconfdir=/private/etc --with-embedded-libevent \
-           --without-json --without-snmp \
+           --without-snmp \
            CFLAGS="-mmacosx-version-min=10.9" \
            LDFLAGS="-mmacosx-version-min=10.9"
         make -C osx pkg
@@ -113,11 +115,11 @@ Installation (Android)
 ----------------------
 
 You need to download [Android NDK][]. Once unpacked, you can generate
-a toolchain using the following command:
+a toolchain using the following command (for ARM64):
 
     ./build/tools/make-standalone-toolchain.sh \
-        --platform=android-9 \
-        --arch=arm \
+        --platform=android-24 \
+        --arch=arm64 \
         --install-dir=../android-toolchain
     export TOOLCHAIN=$PWD/../android-toolchain
 
@@ -126,8 +128,19 @@ Then, you can build `lldpd` with the following commands:
     mkdir build && cd build
     export PATH=$PATH:$TOOLCHAIN/bin
     ../configure \
-        --host=arm-linux-androideabi \
-        --with-sysroot=$TOOLCHAIN/sysroot
+        --host=arm64-linux-androideabi \
+        --with-sysroot=$TOOLCHAIN/sysroot \
+        --prefix=/system \
+        --sbindir=/system/bin \
+        --runstatedir=/data/data/lldpd \
+        --with-privsep-user=root \
+        --with-privsep-group=root
+    make
+    make install DESTDIR=$PWD/install
+
+Then, copy `install/system/bin/*` to `/system/bin` on the target
+system and `install/system/lib/*.so*` to `/system/lib` on the target
+system. You may need to create `/data/data/lldpd` as well.
 
 [Android NDK]: http://developer.android.com/tools/sdk/ndk/index.html
 
@@ -297,6 +310,14 @@ You can use `tcpdump` to look after the packets received and send by
 `lldpd`. To look after LLDPU, use:
 
     tcpdump -s0 -vv -pni eth0 ether dst 01:80:c2:00:00:0e
+
+Intel X710 cards may handle LLDP themselves, intercepting any incoming
+packets. If you don't see anything through `tcpdump`, check if you
+have such a card (with `lspci`) and stop the embedded LLDP daemon:
+
+    for f in /sys/kernel/debug/i40e/*/command; do
+        echo lldp stop > $f
+    done
 
 License
 -------

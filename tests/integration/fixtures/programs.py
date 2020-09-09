@@ -13,6 +13,8 @@ import platform
 import ctypes
 from collections import namedtuple
 
+from .namespaces import mount_proc, mount_tmpfs
+
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 
 
@@ -27,47 +29,6 @@ def mount_bind(source, target):
         raise OSError(e, os.strerror(e))
 
 
-def mount_tmpfs(target, private=False):
-    flags = [0]
-    if private:
-        flags.append(1 << 18)   # MS_PRIVATE
-        flags.append(1 << 19)   # MS_SLAVE
-    for fl in flags:
-        ret = libc.mount(b"none",
-                         target.encode('ascii'),
-                         b"tmpfs",
-                         fl,
-                         None)
-        if ret == -1:
-            e = ctypes.get_errno()
-            raise OSError(e, os.strerror(e))
-
-
-def _mount_proc(target):
-    flags = [2 | 4 | 8] # MS_NOSUID | MS_NODEV | MS_NOEXEC
-    flags.append(1 << 18)   # MS_PRIVATE
-    flags.append(1 << 19)   # MS_SLAVE
-    for fl in flags:
-        ret = libc.mount(b"proc",
-                         target.encode('ascii'),
-                         b"proc",
-                         fl,
-                         None)
-        if ret == -1:
-            e = ctypes.get_errno()
-            raise OSError(e, os.strerror(e))
-
-
-def mount_proc(target="/proc"):
-    # We need to be sure /proc is correct. We do that in another
-    # process as this doesn't play well with setns().
-    if not os.path.isdir(target):
-        os.mkdir(target)
-    p = multiprocessing.Process(target=_mount_proc, args=(target,))
-    p.start()
-    p.join()
-
-
 def most_recent(*args):
     """Return the most recent files matching one of the provided glob
     expression."""
@@ -77,6 +38,7 @@ def most_recent(*args):
     candidates.sort(key=lambda x: os.stat(x).st_mtime)
     assert len(candidates) > 0
     return candidates[0]
+
 
 libtool_location = most_recent('../../libtool',
                                '../../*/libtool')
@@ -167,12 +129,18 @@ class LldpdFactory(object):
 
     def killall(self):
         for p in self.pids[:]:
-            os.kill(p, signal.SIGTERM)
+            try:
+                os.kill(p, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
         for t in self.threads:
             if t.is_alive():
                 t.join(1)
         for p in self.pids[:]:
-            os.kill(p, signal.SIGKILL)
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
         for t in self.threads:
             if t.is_alive():
                 t.join(1)
@@ -181,7 +149,6 @@ class LldpdFactory(object):
         # Setup privsep. While not enforced, we assume we are running in a
         # throwaway mount namespace.
         tmpdir = self.tmpdir
-        mount_proc()
         if self.config.lldpd.privsep.enabled:
             # Chroot
             chroot = self.config.lldpd.privsep.chroot
@@ -214,10 +181,6 @@ class LldpdFactory(object):
                 fgroup += "{}:x:39861:\n".format(group)
                 _replace_file(tmpdir, "/etc/passwd", passwd)
                 _replace_file(tmpdir, "/etc/group", fgroup)
-
-        # Also setup the "namespace-dependant" directory
-        tmpdir.join("ns").ensure(dir=True)
-        mount_tmpfs(str(tmpdir.join("ns")), private=True)
 
         # We also need a proper /etc/os-release
         _replace_file(tmpdir, "/etc/os-release",
@@ -315,6 +278,89 @@ def lldpcli(request, tmpdir):
     return run
 
 
+@pytest.fixture()
+def snmpd(request, tmpdir):
+    """Execute ``snmpd``."""
+    count = [0]
+
+    def run(*args):
+        conffile = tmpdir.join("ns", "snmpd.conf")
+        pidfile = tmpdir.join("ns", "snmpd.pid")
+        with conffile.open("w") as f:
+            f.write("""
+rocommunity public
+rwcommunity private
+master agentx
+trap2sink 127.0.0.1
+""")
+        sargs = ("-I",
+                 "snmp_mib,sysORTable"
+                 ",usmConf,usmStats,usmUser"
+                 ",vacm_conf,vacm_context,vacm_vars",
+                 "-Ln",
+                 "-p", str(pidfile),
+                 "-C", "-c", str(conffile))
+        try:
+            p = subprocess.Popen(("snmpd",) + sargs + args,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        except OSError as e:
+            if e.errno == os.errno.ENOENT:
+                pytest.skip("snmpd not present")
+                return
+            raise e
+        stdout, stderr = p.communicate(timeout=5)
+        result = namedtuple('ProcessResult',
+                            ['returncode', 'stdout', 'stderr'])(
+                                p.returncode, stdout, stderr)
+        request.node.add_report_section(
+            'run', 'snmpd output {}'.format(count[0]),
+            format_process_output("snmpd", sargs, result))
+        count[0] += 1
+        time.sleep(1)
+
+        def kill():
+            try:
+                with pidfile.open("r") as p:
+                    os.kill(int(p.read()))
+            except:
+                pass
+        request.addfinalizer(kill)
+
+    return run
+
+
+@pytest.fixture()
+def snmpwalk():
+    def run(*args):
+        try:
+            p = subprocess.Popen(("env", "MIBDIRS=",
+                                  "snmpwalk",
+                                  "-v2c", "-c", "private",
+                                  "-Ob", "-Oe", "-On",
+                                  "localhost") + args,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        except OSError as e:
+            if e.errno == os.errno.ENOENT:
+                pytest.skip("snmpwalk not present")
+                return
+            raise e
+        stdout, stderr = p.communicate(timeout=30)
+        result = namedtuple('ProcessResult',
+                            ['returncode', 'stdout', 'stderr'])(
+                                p.returncode, stdout, stderr)
+        # When keyvalue is requested, return a formatted result
+        assert result.returncode == 0
+        out = {}
+        for k, v in [l.split(' = ', 2)
+                     for l in result.stdout.decode('ascii').split("\n")
+                     if ' = ' in l]:
+            out[k] = v
+        return out
+    return run
+
+
 def pytest_runtest_makereport(item, call):
     """Collect outputs written to tmpdir and put them in report."""
     # Only do that after tests are run, but not on teardown (too late)
@@ -403,6 +449,19 @@ def pytest_configure(config):
                                    re.search(r"^lldpd (.*)$",
                                              output, re.MULTILINE).group(1))
 
+    # Also retrieve some kernel capabilities
+    features = []
+    for feature in ["rtnl-link-team"]:
+        ret = subprocess.call(["/sbin/modprobe", "--quiet", "--dry-run",
+                               feature])
+        if ret == 0:
+            features.append(feature)
+    config.kernel = namedtuple('kernel',
+                               ['features',
+                                'version'])(
+                                    features,
+                                    os.uname().release)
+
 
 def pytest_report_header(config):
     """Report lldpd/lldpcli version and configuration."""
@@ -411,6 +470,8 @@ def pytest_report_header(config):
                                           config.lldpd.features)))
     print('lldpcli: {} {}'.format(config.lldpcli.version,
                                   ", ".join(config.lldpcli.outputs)))
+    print('kernel: {} {}'.format(config.kernel.version,
+                                 ", ".join(config.kernel.features)))
     print('{}: {} {} {}'.format(platform.system().lower(),
                                 platform.release(),
                                 platform.version(),

@@ -252,15 +252,15 @@ display_chassis(struct writer* w, lldpctl_atom_t* chassis, int details)
 	}
 	tag_datatag(w, "descr", "SysDescr",
 	    lldpctl_atom_get_str(chassis, lldpctl_k_chassis_descr));
-	if (details)
-		tag_datatag(w, "ttl", "TTL",
-		    lldpctl_atom_get_str(chassis, lldpctl_k_chassis_ttl));
 
 	/* Management addresses */
 	mgmts = lldpctl_atom_get(chassis, lldpctl_k_chassis_mgmt);
 	lldpctl_atom_foreach(mgmts, mgmt) {
 		tag_datatag(w, "mgmt-ip", "MgmtIP",
 		    lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_ip));
+		if (lldpctl_atom_get_int(mgmt, lldpctl_k_mgmt_iface_index))
+			tag_datatag(w, "mgmt-iface", "MgmtIface",
+			    lldpctl_atom_get_str(mgmt, lldpctl_k_mgmt_iface_index));
 	}
 	lldpctl_atom_dec_ref(mgmts);
 
@@ -343,6 +343,9 @@ display_autoneg(struct writer * w, int advertised, int bithd, int bitfd, char *d
 static void
 display_port(struct writer *w, lldpctl_atom_t *port, int details)
 {
+	int vlan_tx_tag;
+	char buf[5]; /* should be enough for printing */
+
 	tag_start(w, "port", "Port");
 	tag_start(w, "id", "PortID");
 	tag_attr (w, "type", "",
@@ -353,6 +356,22 @@ display_port(struct writer *w, lldpctl_atom_t *port, int details)
 	tag_datatag(w, "descr", "PortDescr",
 	    lldpctl_atom_get_str(port, lldpctl_k_port_descr));
 
+	if ((vlan_tx_tag = lldpctl_atom_get_int(port, lldpctl_k_port_vlan_tx)) != -1) {
+		tag_start(w, "vlanTX", "VlanTX");
+		snprintf(buf, sizeof(buf), "%d", vlan_tx_tag & 0xfff);
+		tag_attr (w, "id", "VID", buf);
+		snprintf(buf, sizeof(buf), "%d", (vlan_tx_tag >> 13) & 0x7);
+		tag_attr (w, "prio", "Prio", buf);
+		snprintf(buf, sizeof(buf), "%d", (vlan_tx_tag >> 12) & 0x1);
+		tag_attr (w, "dei", "DEI", buf);
+		tag_end(w);
+	}
+
+	if (details &&
+	    lldpctl_atom_get_int(port, lldpctl_k_port_ttl) > 0)
+		tag_datatag(w, "ttl", "TTL",
+		    lldpctl_atom_get_str(port, lldpctl_k_port_ttl));
+
 	/* Dot3 */
 	if (details == DISPLAY_DETAILS) {
 		tag_datatag(w, "mfs", "MFS",
@@ -360,14 +379,15 @@ display_port(struct writer *w, lldpctl_atom_t *port, int details)
 		tag_datatag(w, "aggregation", "Port is aggregated. PortAggregID",
 		    lldpctl_atom_get_str(port, lldpctl_k_port_dot3_aggregid));
 
-		long int autoneg_support, autoneg_enabled, autoneg_advertised;
+		long int autoneg_support, autoneg_enabled, autoneg_advertised, mautype;
 		autoneg_support = lldpctl_atom_get_int(port,
 		    lldpctl_k_port_dot3_autoneg_support);
 		autoneg_enabled = lldpctl_atom_get_int(port,
 		    lldpctl_k_port_dot3_autoneg_enabled);
 		autoneg_advertised = lldpctl_atom_get_int(port,
 		    lldpctl_k_port_dot3_autoneg_advertised);
-		if (autoneg_support > 0 || autoneg_enabled > 0) {
+		mautype = lldpctl_atom_get_int(port, lldpctl_k_port_dot3_mautype);
+		if (autoneg_support > 0 || autoneg_enabled > 0 || mautype > 0) {
 			tag_start(w, "auto-negotiation", "PMD autoneg");
 			tag_attr (w, "supported", "supported",
 			    (autoneg_support > 0)?"yes":"no");
@@ -426,10 +446,13 @@ display_port(struct writer *w, lldpctl_atom_t *port, int details)
 			tag_data(w, lldpctl_atom_get_str(dot3_power,
 				lldpctl_k_dot3_power_devicetype));;
 			tag_end(w);
-			tag_start(w, "pairs", "Power pairs");
-			tag_data(w, lldpctl_atom_get_str(dot3_power,
-				lldpctl_k_dot3_power_pairs));
-			tag_end(w);
+			if (lldpctl_atom_get_int(dot3_power,
+			    lldpctl_k_dot3_power_devicetype) == LLDP_DOT3_POWER_PSE) {
+				tag_start(w, "pairs", "Power pairs");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+				    lldpctl_k_dot3_power_pairs));
+				tag_end(w);
+			}
 			tag_start(w, "class", "Class");
 			tag_data(w, lldpctl_atom_get_str(dot3_power,
 				lldpctl_k_dot3_power_class));
@@ -464,12 +487,102 @@ display_port(struct writer *w, lldpctl_atom_t *port, int details)
 				tag_end(w);
 			}
 
+			/* 802.3bt */
+			if (lldpctl_atom_get_int(dot3_power,
+				lldpctl_k_dot3_power_type_ext) > LLDP_DOT3_POWER_8023BT_OFF) {
+				tag_start(w, "requested-a", "Requested mode A");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_requested_a));
+				tag_end(w);
+				tag_start(w, "requested-b", "Requested mode B");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_requested_b));
+				tag_end(w);
+				tag_start(w, "allocated-a", "Allocated alternative A");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_allocated_a));
+				tag_end(w);
+				tag_start(w, "allocated-b", "Allocated alternative B");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_allocated_b));
+				tag_end(w);
+				tag_start(w, "pse-powering-status", "PSE powering status");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_pse_status));
+				tag_end(w);
+				tag_start(w, "pd-powering-status", "PD powering status");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_pd_status));
+				tag_end(w);
+				tag_start(w, "power-pairs-ext", "Power pairs extra");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_pse_pairs_ext));
+				tag_end(w);
+				tag_start(w, "power-class-ext-a", "Class extra A");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_class_a));
+				tag_end(w);
+				tag_start(w, "power-class-ext-b", "Class extra B");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_class_b));
+				tag_end(w);
+				tag_start(w, "power-class-ext", "Class extra");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_class_ext));
+				tag_end(w);
+				tag_start(w, "power-type-ext", "Power type extra");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_type_ext));
+				tag_end(w);
+				tag_start(w, "pd-load", "PD load");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_pd_load));
+				tag_end(w);
+				tag_start(w, "max-power", "PSE maximum available power");
+				tag_data(w, lldpctl_atom_get_str(dot3_power,
+					lldpctl_k_dot3_power_pse_max));
+				tag_end(w);
+			}
+
 			tag_end(w);
 		}
 		lldpctl_atom_dec_ref(dot3_power);
 	}
 
 	tag_end(w);
+}
+
+static void
+display_local_ttl(struct writer *w, lldpctl_conn_t *conn, int details)
+{
+	char *ttl;
+	long int tx_hold;
+	long int tx_interval;
+
+	lldpctl_atom_t *configuration;
+	configuration = lldpctl_get_configuration(conn);
+	if (!configuration) {
+		log_warnx("lldpctl", "not able to get configuration. %s",
+		    lldpctl_last_strerror(conn));
+		return;
+	}
+
+	tx_hold = lldpctl_atom_get_int(configuration, lldpctl_k_config_tx_hold);
+	tx_interval = lldpctl_atom_get_int(configuration, lldpctl_k_config_tx_interval_ms);
+
+	tx_interval = (tx_interval * tx_hold + 999) / 1000;
+
+	if (asprintf(&ttl, "%lu", tx_interval) == -1) {
+		log_warnx("lldpctl", "not enough memory to build TTL.");
+		goto end;
+	}
+
+	tag_start(w, "ttl", "TTL");
+	tag_attr(w, "ttl", "", ttl);
+	tag_end(w);
+	free(ttl);
+end:
+	lldpctl_atom_dec_ref(configuration);
 }
 
 static void
@@ -486,14 +599,16 @@ display_vlans(struct writer *w, lldpctl_atom_t *port)
 	lldpctl_atom_foreach(vlans, vlan) {
 		vid = lldpctl_atom_get_int(vlan,
 		    lldpctl_k_vlan_id);
-		if (pvid == vid)
-			foundpvid = 1;
 
 		tag_start(w, "vlan", "VLAN");
 		tag_attr(w, "vlan-id", "",
 		    lldpctl_atom_get_str(vlan, lldpctl_k_vlan_id));
-		if (pvid == vid)
+		if (pvid == vid) {
 			tag_attr(w, "pvid", "pvid", "yes");
+			foundpvid = 1;
+		} else {
+			tag_attr(w, "pvid", "pvid", "no");
+		}
 		tag_data(w, lldpctl_atom_get_str(vlan,
 			lldpctl_k_vlan_name));
 		tag_end(w);
@@ -581,43 +696,51 @@ display_local_chassis(lldpctl_conn_t *conn, struct writer *w,
 
 void
 display_interface(lldpctl_conn_t *conn, struct writer *w, int hidden,
-    lldpctl_atom_t *iface, lldpctl_atom_t *neighbor, int details, int protocol)
+    lldpctl_atom_t *iface, lldpctl_atom_t *port, int details, int protocol)
 {
+	int local = 0;
+
 	if (!hidden &&
-	    lldpctl_atom_get_int(neighbor, lldpctl_k_port_hidden))
+	    lldpctl_atom_get_int(port, lldpctl_k_port_hidden))
 		return;
 
 	/* user might have specified protocol to filter on display */
 	if ((protocol != LLDPD_MODE_MAX) &&
-	    (protocol != lldpctl_atom_get_int(neighbor, lldpctl_k_port_protocol)))
+	    (protocol != lldpctl_atom_get_int(port, lldpctl_k_port_protocol)))
 	    return;
 
-	lldpctl_atom_t *chassis = lldpctl_atom_get(neighbor, lldpctl_k_port_chassis);
+	/* Infer local / remote port from the port index (remote == 0) */
+	local = lldpctl_atom_get_int(port, lldpctl_k_port_index)>0?1:0;
+
+	lldpctl_atom_t *chassis = lldpctl_atom_get(port, lldpctl_k_port_chassis);
 
 	tag_start(w, "interface", "Interface");
 	tag_attr(w, "name", "",
 	    lldpctl_atom_get_str(iface, lldpctl_k_interface_name));
 	tag_attr(w, "via" , "via",
-	    lldpctl_atom_get_str(neighbor, lldpctl_k_port_protocol));
+	    lldpctl_atom_get_str(port, lldpctl_k_port_protocol));
 	if (details > DISPLAY_BRIEF) {
-		tag_attr(w, "rid" , "RID",
-		    lldpctl_atom_get_str(chassis, lldpctl_k_chassis_index));
+		if (!local)
+			tag_attr(w, "rid" , "RID",
+			    lldpctl_atom_get_str(chassis, lldpctl_k_chassis_index));
 		tag_attr(w, "age" , "Time",
-		    display_age(lldpctl_atom_get_int(neighbor, lldpctl_k_port_age)));
+		    display_age(lldpctl_atom_get_int(port, lldpctl_k_port_age)));
 	}
 
 	display_chassis(w, chassis, details);
-	display_port(w, neighbor, details);
+	display_port(w, port, details);
+	if (details && local && conn)
+		display_local_ttl(w, conn, details);
 	if (details == DISPLAY_DETAILS) {
-		display_vlans(w, neighbor);
-		display_ppvids(w, neighbor);
-		display_pids(w, neighbor);
-		display_med(w, neighbor, chassis);
+		display_vlans(w, port);
+		display_ppvids(w, port);
+		display_pids(w, port);
+		display_med(w, port, chassis);
 	}
 
 	lldpctl_atom_dec_ref(chassis);
 
-	display_custom_tlvs(w, neighbor);
+	display_custom_tlvs(w, port);
 
 	tag_end(w);
 }
@@ -627,8 +750,8 @@ display_interface(lldpctl_conn_t *conn, struct writer *w, int hidden,
  *
  * @param conn       Connection to lldpd.
  * @param w          Writer.
- * @param hidden     Whatever to show hidden ports.
  * @param env        Environment from which we may find the list of ports.
+ * @param hidden     Whatever to show hidden ports.
  * @param details    Level of details we need (DISPLAY_*).
  */
 void
@@ -673,6 +796,34 @@ display_interfaces(lldpctl_conn_t *conn, struct writer *w,
 	}
 	tag_end(w);
 }
+
+
+/**
+ * Display information about local interfaces.
+ *
+ * @param conn       Connection to lldpd.
+ * @param w          Writer.
+ * @param hidden     Whatever to show hidden ports.
+ * @param env        Environment from which we may find the list of ports.
+ * @param details    Level of details we need (DISPLAY_*).
+ */
+void
+display_local_interfaces(lldpctl_conn_t *conn, struct writer *w,
+    struct cmd_env *env,
+    int hidden, int details)
+{
+	lldpctl_atom_t *iface;
+	int protocol = LLDPD_MODE_MAX;
+
+	tag_start(w, "lldp", "LLDP interfaces");
+	while ((iface = cmd_iterate_on_interfaces(conn, env))) {
+		lldpctl_atom_t *port;
+		port      = lldpctl_get_port(iface);
+		display_interface(conn, w, hidden, iface, port, details, protocol);
+		lldpctl_atom_dec_ref(port);
+	}
+	tag_end(w);
+ }
 
 void
 display_stat(struct writer *w, const char *tag, const char *descr,
@@ -815,8 +966,12 @@ display_configuration(lldpctl_conn_t *conn, struct writer *w)
 
 	tag_datatag(w, "tx-delay", "Transmit delay",
 	    lldpctl_atom_get_str(configuration, lldpctl_k_config_tx_interval));
+	tag_datatag(w, "tx-delay-ms", "Transmit delay in milliseconds",
+	    lldpctl_atom_get_str(configuration, lldpctl_k_config_tx_interval_ms));
 	tag_datatag(w, "tx-hold", "Transmit hold",
 	    lldpctl_atom_get_str(configuration, lldpctl_k_config_tx_hold));
+	tag_datatag(w, "max-neighbors", "Maximum number of neighbors",
+	    lldpctl_atom_get_str(configuration, lldpctl_k_config_max_neighbors));
 	tag_datatag(w, "rx-only", "Receive mode",
 	    lldpctl_atom_get_int(configuration, lldpctl_k_config_receiveonly)?
 	    "yes":"no");
@@ -824,8 +979,12 @@ display_configuration(lldpctl_conn_t *conn, struct writer *w)
 	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_mgmt_pattern)));
 	tag_datatag(w, "iface-pattern", "Interface pattern",
 	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_iface_pattern)));
+	tag_datatag(w, "perm-iface-pattern", "Permanent interface pattern",
+	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_perm_iface_pattern)));
 	tag_datatag(w, "cid-pattern", "Interface pattern for chassis ID",
 	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_cid_pattern)));
+	tag_datatag(w, "cid-string", "Override chassis ID with",
+	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_cid_string)));
 	tag_datatag(w, "description", "Override description with",
 	    N(lldpctl_atom_get_str(configuration, lldpctl_k_config_description)));
 	tag_datatag(w, "platform", "Override platform with",

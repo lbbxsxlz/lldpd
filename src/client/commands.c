@@ -18,6 +18,9 @@
 #include "client.h"
 #include <string.h>
 #include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 /**
  * An element of the environment (a key and a value).
@@ -68,6 +71,7 @@ struct cmd_node {
 	const char *token;	/**< Token to enter this cnode */
 	const char *doc;	/**< Documentation string */
 	int privileged;		/**< Privileged command? */
+	int lock;		/**< Lock required for execution? */
 	int hidden;		/**< Hidden command? */
 
 	/**
@@ -110,6 +114,21 @@ struct cmd_node*
 commands_privileged(struct cmd_node *node)
 {
 	if (node) node->privileged = 1;
+	return node;
+}
+
+/**
+ * Make a node accessible only with a lock.
+ *
+ * @param node node to use lock to execute
+ * @return the modified node
+ *
+ * The node is modified. It is returned to ease chaining.
+ */
+struct cmd_node*
+commands_lock(struct cmd_node *node)
+{
+	if (node) node->lock = 1;
 	return node;
 }
 
@@ -344,6 +363,7 @@ _commands_execute(struct lldpctl_conn_t *conn, struct writer *w,
 	int n, rc = 0, completion = (word != NULL);
 	int help = 0;		/* Are we asking for help? */
 	int complete = 0;	/* Are we asking for possible completions? */
+	int needlock = 0;	/* Do we need a lock? */
 	struct cmd_env env = {
 		.elements = TAILQ_HEAD_INITIALIZER(env.elements),
 		.stack = TAILQ_HEAD_INITIALIZER(env.stack),
@@ -351,6 +371,7 @@ _commands_execute(struct lldpctl_conn_t *conn, struct writer *w,
 		.argv = argv,
 		.argp = 0
 	};
+	static int lockfd = -1;
 	cmdenv_push(&env, root);
 	if (!completion)
 		for (n = 0; n < argc; n++)
@@ -388,6 +409,7 @@ _commands_execute(struct lldpctl_conn_t *conn, struct writer *w,
 				    !strcmp(candidate->token, token)) {
 					/* Exact match */
 					best = candidate;
+					needlock = needlock || candidate->lock;
 					break;
 				}
 				if (!best) best = candidate;
@@ -406,6 +428,7 @@ _commands_execute(struct lldpctl_conn_t *conn, struct writer *w,
 				if (!candidate->token &&
 				    CAN_EXECUTE(candidate)) {
 					best = candidate;
+					needlock = needlock || candidate->lock;
 					break;
 				}
 			}
@@ -421,9 +444,38 @@ _commands_execute(struct lldpctl_conn_t *conn, struct writer *w,
 
 		/* Push and execute */
 		cmdenv_push(&env, best);
-		if (best->execute && best->execute(conn, w, &env, best->arg) != 1) {
-			rc = -1;
-			goto end;
+		if (best->execute) {
+			struct sockaddr_un su;
+			if (needlock) {
+				if (lockfd == -1) {
+					log_debug("lldpctl", "reopen %s for locking", ctlname);
+					if ((lockfd = socket(PF_UNIX, SOCK_STREAM, 0)) == -1) {
+						log_warn("lldpctl", "cannot open for lock %s", ctlname);
+						rc = -1;
+						goto end;
+					}
+					su.sun_family = AF_UNIX;
+					strlcpy(su.sun_path, ctlname, sizeof(su.sun_path));
+					if (connect(lockfd, (struct sockaddr *)&su, sizeof(struct sockaddr_un)) == -1) {
+						log_warn("lldpctl", "cannot connect to socket %s", ctlname);
+						rc = -1;
+						close(lockfd); lockfd = -1;
+						goto end;
+					}
+				}
+				if (lockf(lockfd, F_LOCK, 0) == -1) {
+					log_warn("lldpctl", "cannot get lock on %s", ctlname);
+					rc = -1;
+					close(lockfd); lockfd = -1;
+					goto end;
+				}
+			}
+			rc = best->execute(conn, w, &env, best->arg) != 1 ? -1 : rc;
+			if (needlock && lockf(lockfd, F_ULOCK, 0) == -1) {
+				log_warn("lldpctl", "cannot unlock %s", ctlname);
+				close(lockfd); lockfd = -1;
+			}
+			if (rc == -1) goto end;
 		}
 		env.argp++;
 	}
@@ -504,7 +556,7 @@ end:
 					if (!complete) {
 						snprintf(fmt, sizeof(fmt),
 						    "%s%%%ds%s  %%s\n",
-						    "\033[1;30m", (int)maxl, "\033[0m");
+						    "\033[1m", (int)maxl, "\033[0m");
 						fprintf(stderr, fmt,
 						    cword->word ? cword->word : "WORD",
 						    cword->doc ?  cword->doc  : "...");
@@ -703,7 +755,10 @@ cmd_iterate_on_interfaces(struct lldpctl_conn_t *conn, struct cmd_env *env)
 			if (!iter) return NULL;
 		} else {
 			iter = lldpctl_atom_iter_next(iface_list, iter);
-			if (iface) lldpctl_atom_dec_ref(iface); iface = NULL;
+			if (iface) {
+				lldpctl_atom_dec_ref(iface);
+				iface = NULL;
+			}
 			if (!iter) {
 				lldpctl_atom_dec_ref(iface_list);
 				return NULL;
@@ -750,7 +805,7 @@ cmd_iterate_on_ports(struct lldpctl_conn_t *conn, struct cmd_env *env, const cha
 			last_port = lldpctl_get_port(iface);
 			return last_port;
 		}
-		if (!iface && !interfaces) {
+		if (!interfaces) {
 			put_default = 1;
 			*name = "(default)";
 			last_port = lldpctl_get_default_port(conn);

@@ -2,21 +2,44 @@
 
 set -e
 
-[ $CC != gcc ] || CC=gcc-5
-[ $(uname -s) != Linux ] || LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS --enable-sanitizers"
+LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS --enable-pie"
+case "$(uname -s)" in
+    Linux)
+        LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS --localstatedir=/var --sysconfdir=/etc --prefix=/usr"
+        [ $(uname -m) != x86_64 ] || \
+            LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS --enable-sanitizers"
+        LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS LDFLAGS=-fuse-ld=gold"
+        ;;
+    Darwin)
+        LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS CFLAGS=-mmacosx-version-min=10.9"
+        LLDPD_CONFIG_ARGS="$LLDPD_CONFIG_ARGS LDFLAGS=-mmacosx-version-min=10.9"
+        ;;
+esac
 
 ./autogen.sh
-./configure $LLDPD_CONFIG_ARGS \
-            --enable-pie \
-            --localstatedir=/var --sysconfdir=/etc --prefix=/usr \
-            CFLAGS="-O1 -g" LDFLAGS="-fuse-ld=gold"
-make all check CFLAGS=-Werror
-make distcheck
+./configure $LLDPD_CONFIG_ARGS || {
+    cat config.log
+    exit 1
+}
+make all ${MAKE_ARGS-CFLAGS=-Werror} || make all ${MAKE_ARGS-CFLAGS=-Werror} V=1
+
+# Temporarily don't run checks with clang, due to libcheck incompatibility:
+# See: <https://github.com/libcheck/check/issues/276>
+if [ "$CC" != clang ]; then
+    make check ${MAKE_ARGS-CFLAGS=-Werror} || {
+        [ ! -f tests/test-suite.log ] || cat tests/test-suite.log
+        exit 1
+    }
+    make distcheck
+fi
 
 case "$(uname -s)" in
     Darwin)
         # Create a package
         make -C osx pkg
+        otool -l osx/lldpd*/usr/local/sbin/lldpd
+        mkdir upload
+        mv *.pkg upload
         ;;
     Linux)
         # Integration tests

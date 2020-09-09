@@ -21,4 +21,4 @@ edit = $(SED) \
         -e 's|@PRIVSEP_CHROOT[@]|$(PRIVSEP_CHROOT)|g'
 
 $(TEMPLATES): Makefile
-	$(AM_V_GEN)mkdir -p $(@D) && $(edit) $(srcdir)/$@.in > $@.tmp && mv $@.tmp $@
+	$(AM_V_GEN)$(MKDIR_P) $(@D) && $(edit) $(srcdir)/$@.in > $@.tmp && mv $@.tmp $@

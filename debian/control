@@ -8,18 +8,17 @@ Build-Depends: debhelper (>= 5),
                dh-autoreconf,
                libsnmp-dev,
                libxml2-dev,
-               libjansson-dev | libjson-c-dev | libjson0-dev (>= 0.10),
                libevent-dev (>= 2.0.5),
                libreadline-dev,
                libbsd-dev,
-               pkg-config,
-               lsb-release
+               libcap-dev,
+               pkg-config
 Standards-Version: 3.9.6
 Homepage: http://vincentbernat.github.com/lldpd/
 
 Package: lldpd
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser, lsb-base
 Suggests: snmpd
 Description: implementation of IEEE 802.1ab (LLDP)
  LLDP is an industry standard protocol designed to supplant

@@ -14,7 +14,6 @@
 %bcond_without dot3
 %bcond_without custom
 %bcond_without snmp
-%bcond_with json
 
 # On RHEL <= 6, compile with oldies
 # For SuSE, SLE11 with a recent SP comes with 3.0. SLE12 comes with 3.12.
@@ -45,9 +44,9 @@
 
 Summary: Implementation of IEEE 802.1ab (LLDP)
 Name: lldpd
-Version: 0.9.4
+Version: 1.0.6
 Release: 1%{?dist}
-License: MIT
+License: ISC
 Group: System/Management
 URL: http://vincentbernat.github.com/lldpd/
 Source0: http://media.luffy.cx/files/lldpd/%{name}-%{version}.tar.gz
@@ -59,6 +58,7 @@ BuildRequires: pkgconfig
 BuildRequires: libevent-devel
 %endif
 BuildRequires: readline-devel
+BuildRequires: libcap-devel
 %if %{with snmp}
 BuildRequires: net-snmp-devel
 BuildRequires: openssl-devel
@@ -66,9 +66,6 @@ BuildRequires: openssl-devel
 %endif
 %if %{with xml}
 BuildRequires: libxml2-devel
-%endif
-%if %{with json}
-BuildRequires: json-c-devel
 %endif
 %if %{with systemd}
 %if 0%{?suse_version}
@@ -228,6 +225,7 @@ if getent passwd %lldpd_user >/dev/null 2>&1 ; then : ; else \
 %if 0%{?suse_version} >= 1210 && %{with systemd}
 %post
 %service_add_post lldpd.service
+%{fillup_only}
 %preun
 %service_del_preun lldpd.service
 %postun
@@ -286,12 +284,13 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(-,root,root,-)
 %dir %{_docdir}/lldpd
 %doc %{_docdir}/lldpd/NEWS
+%doc %{_docdir}/lldpd/LICENSE
 %doc %{_docdir}/lldpd/ChangeLog
 %doc %{_docdir}/lldpd/README.md
 %doc %{_docdir}/lldpd/CONTRIBUTE.md
 %{_sbindir}/lldpd
 %{_sbindir}/lldpctl
-%{_sbindir}/lldpcli
+%attr(4750,%lldpd_user,adm) %{_sbindir}/lldpcli
 %{_libdir}/liblldpctl.so.*
 %{_datadir}/zsh
 %{_datadir}/bash-completion
@@ -318,6 +317,42 @@ rm -rf $RPM_BUILD_ROOT
 %{_includedir}/lldp-const.h
 
 %changelog
+* Sat Sep 05 2020 Vincent Bernat <bernat@luffy.cx> - 1.0.6-1
+- New upstream version.
+
+* Sat Feb 01 2020 Vincent Bernat <bernat@luffy.cx> - 1.0.5-1
+- New upstream version.
+
+* Sun Jun 15 2019 Vincent Bernat <bernat@luffy.cx> - 1.0.4-1
+- New upstream version.
+
+* Mon Dec 10 2018 Vincent Bernat <bernat@luffy.cx> - 1.0.3-1
+- New upstream version.
+
+* Sat Dec 01 2018 Vincent Bernat <bernat@luffy.cx> - 1.0.2-1
+- New upstream version.
+
+* Mon Apr 09 2018 Vincent Bernat <bernat@luffy.cx> - 1.0.1-1
+- New upstream version.
+
+* Sun Apr 08 2018 Vincent Bernat <bernat@luffy.cx> - 1.0.0-1
+- New upstream version.
+
+* Tue Nov 21 2017 Vincent Bernat <bernat@luffy.cx> - 0.9.9-1
+- New upstream version.
+
+* Sun Aug 20 2017 Vincent Bernat <bernat@luffy.cx> - 0.9.8-1
+- New upstream version.
+
+* Sun Mar 19 2017 Vincent Bernat <bernat@luffy.cx> - 0.9.7-1
+- New upstream version.
+
+* Sat Jan 21 2017 Vincent Bernat <bernat@luffy.cx> - 0.9.6-1
+- New upstream version.
+
+* Fri Sep 30 2016 Vincent Bernat <bernat@luffy.cx> - 0.9.5-1
+- New upstream version.
+
 * Fri Jun 17 2016 Vincent Bernat <bernat@luffy.cx> - 0.9.4-1
 - New upstream version.
 

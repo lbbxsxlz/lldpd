@@ -33,11 +33,22 @@
 #include <net-snmp/agent/snmp_vars.h>
 #include <net-snmp/library/snmpUnixDomain.h>
 
+#ifdef ASN_PRIV_STOP
+/* NetSNMP 5.8+ */
+#define F_SEND_SIGNATURE netsnmp_transport *t, const void *buf, int size, void **opaque, int *olength
+#define F_FMTADDR_SIGNATURE netsnmp_transport *t, const void *data, int len
+#define F_FROM_OSTRING_SIGNATURE const void* o, size_t o_len, int local
+#else
+#define F_SEND_SIGNATURE netsnmp_transport *t, void *buf, int size, void **opaque, int *olength
+#define F_FMTADDR_SIGNATURE netsnmp_transport *t, void *data, int len
+#define F_FROM_OSTRING_SIGNATURE const u_char* o, size_t o_len, int local
+#endif
+
 static oid netsnmp_unix[] = { TRANSPORT_DOMAIN_LOCAL };
 static netsnmp_tdomain unixDomain;
 
 static char *
-agent_priv_unix_fmtaddr(netsnmp_transport *t, void *data, int len)
+agent_priv_unix_fmtaddr(F_FMTADDR_SIGNATURE)
 {
 	/* We don't bother to implement the full function */
 	return strdup("Local Unix socket with privilege separation: unknown");
@@ -80,8 +91,7 @@ recv_error:
 
 #define AGENT_WRITE_TIMEOUT 2000
 static int
-agent_priv_unix_send(netsnmp_transport *t, void *buf, int size,
-    void **opaque, int *olength)
+agent_priv_unix_send(F_SEND_SIGNATURE)
 {
 	int rc = -1;
 
@@ -198,26 +208,28 @@ agent_priv_unix_transport(const char *string, int len, int local)
 	return t;
 }
 
-netsnmp_transport *
-#if !HAVE_NETSNMP_TDOMAIN_F_CREATE_FROM_TSTRING_NEW
-agent_priv_unix_create_tstring(const char *string, int local)
-#else
-agent_priv_unix_create_tstring(const char *string, int local, const char *default_target)
-#endif
-{
 #if HAVE_NETSNMP_TDOMAIN_F_CREATE_FROM_TSTRING_NEW
+netsnmp_transport *
+agent_priv_unix_create_tstring_new(const char *string, int local, const char *default_target)
+{
 	if ((!string || *string == '\0') && default_target &&
 	    *default_target != '\0') {
 		string = default_target;
 	}
-#endif
-	if (!string)
-		return NULL;
+	if (!string) return NULL;
 	return agent_priv_unix_transport(string, strlen(string), local);
 }
+#else
+netsnmp_transport *
+agent_priv_unix_create_tstring(const char *string, int local)
+{
+	if (!string) return NULL;
+	return agent_priv_unix_transport(string, strlen(string), local);
+}
+#endif
 
 static netsnmp_transport *
-agent_priv_unix_create_ostring(const u_char * o, size_t o_len, int local)
+agent_priv_unix_create_ostring(F_FROM_OSTRING_SIGNATURE)
 {
 	return agent_priv_unix_transport((char *)o, o_len, local);
 }
@@ -229,10 +241,10 @@ agent_priv_register_domain()
 	unixDomain.name_length = sizeof(netsnmp_unix) / sizeof(oid);
 	unixDomain.prefix = (const char**)calloc(2, sizeof(char *));
 	unixDomain.prefix[0] = "unix";
-#if !HAVE_NETSNMP_TDOMAIN_F_CREATE_FROM_TSTRING_NEW
-	unixDomain.f_create_from_tstring = agent_priv_unix_create_tstring;
+#if HAVE_NETSNMP_TDOMAIN_F_CREATE_FROM_TSTRING_NEW
+	unixDomain.f_create_from_tstring_new = agent_priv_unix_create_tstring_new;
 #else
-	unixDomain.f_create_from_tstring_new = agent_priv_unix_create_tstring;
+	unixDomain.f_create_from_tstring = agent_priv_unix_create_tstring;
 #endif
 	unixDomain.f_create_from_ostring = agent_priv_unix_create_ostring;
 	netsnmp_tdomain_register(&unixDomain);

@@ -38,7 +38,7 @@ extern int unregister_sysORTable(oid *, size_t);
 #define scfg agent_scfg
 struct lldpd *agent_scfg;
 
-static inline uint8_t
+static uint8_t
 swap_bits(uint8_t n)
 {
   n = ((n&0xF0) >>4 ) | ( (n&0x0F) <<4);
@@ -294,6 +294,40 @@ header_tpripindexed_table(struct variable *vp, oid *name, size_t *length,
 	}
 	return header_index_best();
 }
+
+#ifdef ENABLE_CUSTOM
+static struct lldpd_custom*
+header_tprcustomindexed_table(struct variable *vp, oid *name, size_t *length,
+    int exact, size_t *var_len, WriteMethod **write_method)
+{
+	struct lldpd_hardware *hardware;
+	struct lldpd_port *port;
+	struct lldpd_custom *custom;
+	oid index[8];
+	oid idx;
+
+	if (!header_index_init(vp, name, length, exact, var_len, write_method)) return NULL;
+	TAILQ_FOREACH(hardware, &scfg->g_hardware, h_entries) {
+		TAILQ_FOREACH(port, &hardware->h_rports, p_entries) {
+			if (SMART_HIDDEN(port)) continue;
+			idx = 1;
+			TAILQ_FOREACH(custom, &port->p_custom_list, next) {
+				index[0] = lastchange(port);
+				index[1] = hardware->h_ifindex;
+				index[2] = port->p_chassis->c_index;
+				index[3] = custom->oui[0];
+				index[4] = custom->oui[1];
+				index[5] = custom->oui[2];
+				index[6] = custom->subtype;
+				index[7] = idx++;
+				if (header_index_add(index, 8, custom))
+					return custom;
+			}
+		}
+	}
+	return header_index_best();
+}
+#endif
 
 #ifdef ENABLE_LLDPMED
 #define TPR_VARIANT_MED_POLICY 2
@@ -552,6 +586,8 @@ header_tprpiindexed_table(struct variable *vp, oid *name, size_t *length,
 #define LLDP_SNMP_ADDR_IFSUBTYPE 2
 #define LLDP_SNMP_ADDR_IFID 3
 #define LLDP_SNMP_ADDR_OID 4
+/* Custom TLVs */
+#define LLDP_SNMP_ORG_DEF_INFO 1
 /* LLDP-MED */
 #define LLDP_SNMP_MED_CAP_AVAILABLE 1
 #define LLDP_SNMP_MED_CAP_ENABLED 2
@@ -603,10 +639,10 @@ agent_h_scalars(struct variable *vp, oid *name, size_t *length,
 
 	switch (vp->magic) {
 	case LLDP_SNMP_TXINTERVAL:
-                long_ret = scfg->g_config.c_tx_interval;
+                long_ret = (scfg->g_config.c_tx_interval+999) / 1000;
 		return (u_char *)&long_ret;
 	case LLDP_SNMP_TXMULTIPLIER:
-		long_ret = LOCAL_CHASSIS(scfg)->c_ttl / scfg->g_config.c_tx_interval;
+		long_ret = scfg->g_config.c_tx_hold;
 		return (u_char *)&long_ret;
 	case LLDP_SNMP_REINITDELAY:
 		long_ret = 1;
@@ -619,11 +655,16 @@ agent_h_scalars(struct variable *vp, oid *name, size_t *length,
 		return (u_char *)&long_ret;
 	case LLDP_SNMP_LASTUPDATE:
 		long_ret = 0;
-		TAILQ_FOREACH(hardware, &scfg->g_hardware, h_entries)
-		    TAILQ_FOREACH(port, &hardware->h_rports, p_entries) {
-			if (SMART_HIDDEN(port)) continue;
-			if (port->p_lastchange > long_ret)
-				long_ret = port->p_lastchange;
+		TAILQ_FOREACH(hardware, &scfg->g_hardware, h_entries) {
+			/* Check if the last removal of a remote port on this local port was the last change. */
+			if (hardware->h_lport.p_lastremove > long_ret)
+				long_ret = hardware->h_lport.p_lastremove;
+			/* Check if any change on the existing remote ports was the last change. */
+			TAILQ_FOREACH(port, &hardware->h_rports, p_entries) {
+				if (SMART_HIDDEN(port)) continue;
+				if (port->p_lastchange > long_ret)
+					long_ret = port->p_lastchange;
+			}
 		}
 		if (long_ret)
 			long_ret = (long_ret - starttime.tv_sec) * 100;
@@ -1007,22 +1048,29 @@ static u_char*
 agent_h_local_chassis(struct variable *vp, oid *name, size_t *length,
     int exact, size_t *var_len, WriteMethod **write_method)
 {
+	u_char *a;
+
 	if (header_generic(vp, name, length, exact, var_len, write_method))
 		return NULL;
 
-	return agent_v_chassis(vp, var_len, LOCAL_CHASSIS(scfg));
+	if ((a = agent_v_chassis(vp, var_len, LOCAL_CHASSIS(scfg))) != NULL)
+		return a;
+	TRYNEXT(agent_h_local_chassis);
 }
 static u_char*
 agent_h_remote_chassis(struct variable *vp, oid*name, size_t *length,
     int exact, size_t *var_len, WriteMethod **write_method)
 {
 	struct lldpd_port *port;
+	u_char *a;
 
 	if ((port = header_tprindexed_table(vp, name, length,
 					    exact, var_len, write_method, 0)) == NULL)
 		return NULL;
 
-	return agent_v_chassis(vp, var_len, port->p_chassis);
+	if ((a = agent_v_chassis(vp, var_len, port->p_chassis)) != NULL)
+		return a;
+	TRYNEXT(agent_h_remote_chassis);
 }
 
 static u_char*
@@ -1059,9 +1107,8 @@ agent_h_stats(struct variable *vp, oid *name, size_t *length,
                 long_ret = hardware->h_ageout_cnt;
 		return (u_char *)&long_ret;
 	default:
-		break;
+		return NULL;
         }
-        return NULL;
 }
 
 #ifdef ENABLE_DOT1
@@ -1073,9 +1120,8 @@ agent_v_vlan(struct variable *vp, size_t *var_len, struct lldpd_vlan *vlan)
 		*var_len = strlen(vlan->v_name);
 		return (u_char *)vlan->v_name;
 	default:
-		break;
+		return NULL;
         }
-        return NULL;	
 }
 static u_char*
 agent_h_local_vlan(struct variable *vp, oid *name, size_t *length,
@@ -1115,9 +1161,8 @@ agent_v_ppvid(struct variable *vp, size_t *var_len, struct lldpd_ppvid *ppvid)
 		long_ret = (ppvid->p_cap_status & LLDP_PPVID_CAP_ENABLED)?1:2;
 		return (u_char *)&long_ret;
 	default:
-		break;
+		return NULL;
         }
-        return NULL;	
 }
 static u_char*
 agent_h_local_ppvid(struct variable *vp, oid *name, size_t *length,
@@ -1153,14 +1198,13 @@ agent_v_pi(struct variable *vp, size_t *var_len, struct lldpd_pi *pi)
 		*var_len = pi->p_pi_len;
 		return (u_char *)pi->p_pi;
 	default:
-		break;
+		return NULL;
         }
-        return NULL;
 }
 static u_char*
 agent_h_local_pi(struct variable *vp, oid *name, size_t *length,
 		 int exact, size_t *var_len, WriteMethod **write_method)
-{	
+{
 	struct lldpd_pi *pi;
 
 	if ((pi = header_ppiindexed_table(vp, name, length,
@@ -1372,9 +1416,8 @@ agent_v_management(struct variable *vp, size_t *var_len, struct lldpd_mgmt *mgmt
                 *var_len = sizeof(zeroDotZero);
                 return (u_char*)zeroDotZero;
 	default:
-		break;
+		return NULL;
         }
-        return NULL;
 }
 static u_char*
 agent_h_local_management(struct variable *vp, oid *name, size_t *length,
@@ -1401,6 +1444,32 @@ agent_h_remote_management(struct variable *vp, oid *name, size_t *length,
 
         return agent_v_management(vp, var_len, mgmt);
 }
+
+#ifdef ENABLE_CUSTOM
+static u_char*
+agent_v_custom(struct variable *vp, size_t *var_len, struct lldpd_custom *custom)
+{
+	switch (vp->magic) {
+        case LLDP_SNMP_ORG_DEF_INFO:
+		*var_len = custom->oui_info_len;
+		return (u_char *)custom->oui_info;
+	default:
+		return NULL;
+        }
+}
+static u_char*
+agent_h_remote_custom(struct variable *vp, oid *name, size_t *length,
+    int exact, size_t *var_len, WriteMethod **write_method)
+{
+	struct lldpd_custom *custom;
+
+	if ((custom = header_tprcustomindexed_table(vp, name, length,
+		    exact, var_len, write_method)) == NULL)
+		return NULL;
+
+        return agent_v_custom(vp, var_len, custom);
+}
+#endif
 
 /*
   Here is how it works: a agent_h_*() function will handle incoming
@@ -1472,8 +1541,13 @@ struct variable8 agent_lldp_vars[] = {
          {1, 4, 2, 1, 4}},
         {LLDP_SNMP_ADDR_OID, ASN_OBJECT_ID, RONLY, agent_h_remote_management, 5,
          {1, 4, 2, 1, 5}},
-	/* Dot3, local ports */
+#ifdef ENABLE_CUSTOM
+	/* Custom TLVs */
+	{LLDP_SNMP_ORG_DEF_INFO, ASN_OCTET_STR, RONLY, agent_h_remote_custom, 5,
+	 {1, 4, 4, 1, 4}},
+#endif
 #ifdef ENABLE_DOT3
+	/* Dot3, local ports */
         {LLDP_SNMP_DOT3_AUTONEG_SUPPORT, ASN_INTEGER, RONLY, agent_h_local_port, 8,
          {1, 5, 4623, 1, 2, 1, 1, 1}},
         {LLDP_SNMP_DOT3_AUTONEG_ENABLED, ASN_INTEGER, RONLY, agent_h_local_port, 8,

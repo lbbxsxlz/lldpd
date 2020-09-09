@@ -34,6 +34,7 @@
 .Op Fl M Ar class
 .Op Fl H Ar hide
 .Op Fl L Ar lldpcli
+.Op Fl O Ar configfile
 .Sh DESCRIPTION
 .Nm
 is a daemon able to receive and send
@@ -195,8 +196,10 @@ Without this option, the first IPv4 and the first IPv6 are used. If an
 exact IP address is provided, it is used as a management address
 without any check. If only negative patterns are provided, only one
 IPv4 and one IPv6 addresses are chosen. Otherwise, many of them can be
-selected. If you want to blacklist IPv6 addresses, you can use
+selected. If you want to remove IPv6 addresses, you can use
 .Em !*:* .
+If an interface name is matched, the first IPv4 address and the first
+IPv6 address associated to this interface will be chosen.
 .It Fl u Ar file
 Specify the Unix-domain socket used for communication with
 .Xr lldpctl 8 .
@@ -206,10 +209,10 @@ option,
 .Nm
 will use all available physical interfaces. This option can use
 wildcards. Several interfaces can be specified separated by commas.
-It is also possible to blacklist an interface by suffixing it with an
-exclamation mark. It is possible to whitelist an interface by
-suffixing it with two exclamation marks. A whitelisted interface beats
-a blacklisted interface which beats a simple matched interface. For
+It is also possible to remove an interface by prefixing it with an
+exclamation mark. It is possible to allow an interface by
+prefixing it with two exclamation marks. An allowed interface beats
+a forbidden interface which beats a simple matched interface. For
 example, with
 .Em eth*,!eth1,!eth2
 .Nm
@@ -238,19 +241,25 @@ to compute the chassis ID. The logic of this option is the same as for
 .Fl I
 flag: you can exclude interfaces with an exclamation mark and use
 globbing to specify several interfaces. If all interfaces are
-blacklisted (with
+removed (with
 .Em !* ) ,
 the system name is used as a chassis ID instead.
 .It Fl M Ar class
-Enable emission of LLDP-MED frame. The class should be one of the
-following value:
+Enable emission of LLDP-MED frame. Depending on the selected class,
+the standard defines which set of TLV should be transmitted. See
+section 10.2.1. Some devices may be strict about this aspect. The
+class should be one of the following value:
 .Bl -tag -width "0:XX" -compact
 .It Sy 1
 Generic Endpoint (Class I)
 .It Sy 2
-Media Endpoint (Class II)
+Media Endpoint (Class II). In this case, the standard requires to
+define at least one network policy through
+.Nm lldpcli .
 .It Sy 3
-Communication Device Endpoints (Class III)
+Communication Device Endpoints (Class III). In this case, the standard
+requires to define at least one network policy through
+.Nm lldpcli .
 .It Sy 4
 Network Connectivity Device
 .El
@@ -270,6 +279,12 @@ Provide an alternative path to
 for configuration. If empty, does not use
 .Nm lldpcli
 for configuration.
+.It Fl O Ar configfile
+Override default configuration locations processed by
+.Nm lldpcli
+at start. If a directory is provided, each file contained in it will be read if ending by
+.Sy .conf.
+Order is alphabetical.
 .It Fl v
 Show
 .Nm

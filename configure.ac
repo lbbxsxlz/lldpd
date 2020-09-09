@@ -48,7 +48,6 @@ AC_PROG_CC_C99
 if test x"$ac_cv_prog_cc_c99" = x"no"; then
   AC_MSG_FAILURE([*** C99 support is mandatory])
 fi
-AC_PROG_CXX
 AM_PROG_CC_C_O
 AC_PROG_LIBTOOL
 AC_PROG_LN_S
@@ -77,13 +76,14 @@ AX_CFLAGS_GCC_OPTION([-W], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wextra], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wformat], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wformat-security], [LLDP_CFLAGS])
+AX_CFLAGS_GCC_OPTION([-Wimplicit-fallthrough], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wfatal-errors], [LLDP_CFLAGS])
-AX_CFLAGS_GCC_OPTION([-Wcast-align], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wheader-guard], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wdocumentation], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Winline], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wpointer-arith], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-fno-omit-frame-pointer], [LLDP_CFLAGS])
+AX_CFLAGS_GCC_OPTION([-Wno-cast-align], [LLDP_CFLAGS]) dnl clang is bad at this
 AX_CFLAGS_GCC_OPTION([-Wno-unused-parameter], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wno-missing-field-initializers], [LLDP_CFLAGS])
 AX_CFLAGS_GCC_OPTION([-Wno-sign-compare], [LLDP_CFLAGS]) dnl Should be fixed later
@@ -108,6 +108,8 @@ if test x"$hardening" != x"no"; then
   AX_CFLAGS_GCC_OPTION([-fstack-protector], [LLDP_CFLAGS])
   AX_CFLAGS_GCC_OPTION([-fstack-protector-all], [LLDP_CFLAGS])
   AX_CFLAGS_GCC_OPTION([-fstack-protector-strong], [LLDP_CFLAGS])
+  AX_CFLAGS_GCC_OPTION([-fstack-protector-strong], [LLDP_CFLAGS])
+  AX_CFLAGS_GCC_OPTION([-fstack-clash-protection], [LLDP_CFLAGS])
   AX_CFLAGS_GCC_OPTION([-D_FORTIFY_SOURCE=2], [LLDP_CPPFLAGS])
 fi
 if test x"$pie" = x"yes"; then
@@ -130,6 +132,11 @@ if test x"$sanitizers" != x; then
   LLDP_CFLAGS="$LLDP_CFLAGS $sanitizers"
   LLDP_LDFLAGS="$LLDP_LDFLAGS $sanitizers"
   AC_DEFINE([HAVE_ADDRESS_SANITIZER], 1, [Define if have both address and leak sanitizer])
+elif test x"$hardening" != x"no"; then
+  AX_LDFLAGS_OPTION([-fsanitize=safe-stack], [LLDP_BIN_LDFLAGS])
+  if test x"$ax_cv_ld_check_flag__fsanitize_safe_stack" != x"no"; then
+    AX_CFLAGS_GCC_OPTION([-fsanitize=safe-stack], [LLDP_CFLAGS])
+  fi
 fi
   ])
 
@@ -168,26 +175,44 @@ AC_FUNC_REALLOC
 AC_FUNC_FORK
 
 # Some functions can be in libbsd
-PKG_CHECK_MODULES([libbsd], [libbsd-overlay], [
-  _save_CFLAGS="$CFLAGS"
-  _save_LIBS="$LIBS"
-  CFLAGS="$CFLAGS $libbsd_CFLAGS"
-  LIBS="$LIBS $libbsd_LIBS"
-  AC_MSG_CHECKING([if libbsd can be linked correctly])
-  AC_TRY_LINK([
-@%:@include <sys/time.h>
-@%:@include <sys/types.h>
-],[],
-    [
-      AC_MSG_RESULT(yes)
-      LLDP_CFLAGS="$LLDP_CFLAGS $libbsd_CFLAGS"
-      LLDP_LDFLAGS="$LLDP_LDFLAGS $libbsd_LIBS"
-    ],[
-      AC_MSG_RESULT(no)
-      CFLAGS="$_save_CFLAGS"
-      LIBS="$_save_LIBS"
-    ])
-], [:])
+AC_ARG_WITH([libbsd],
+  AS_HELP_STRING(
+    [--with-libbsd],
+    [Use libbsd @<:@default=auto@:>@]),
+  [],
+  [with_libbsd=auto])
+if test x"$with_libbsd" != x"no"; then
+  PKG_CHECK_MODULES([libbsd], [libbsd-overlay], [
+    _save_CFLAGS="$CFLAGS"
+    _save_LIBS="$LIBS"
+    CFLAGS="$CFLAGS $libbsd_CFLAGS"
+    LIBS="$LIBS $libbsd_LIBS"
+    AC_MSG_CHECKING([if libbsd can be linked correctly])
+    AC_TRY_LINK([
+  @%:@include <sys/time.h>
+  @%:@include <sys/types.h>
+  ],[],
+      [
+        AC_MSG_RESULT(yes)
+        LLDP_CFLAGS="$LLDP_CFLAGS $libbsd_CFLAGS"
+        LLDP_LDFLAGS="$LLDP_LDFLAGS $libbsd_LIBS"
+        with_libbsd=yes
+      ],[
+        AC_MSG_RESULT(no)
+        CFLAGS="$_save_CFLAGS"
+        LIBS="$_save_LIBS"
+        if test x"$with_libbsd" = x"yes"; then
+           AC_MSG_FAILURE([*** no libbsd support found])
+        fi
+        with_libbsd=no
+      ])
+  ], [
+    if test x"$with_libbsd" = x"yes"; then
+       AC_MSG_FAILURE([*** no libbsd support found])
+    fi
+    with_libbsd=no
+  ])
+fi
 
 # setproctitle may have an _init function
 AC_REPLACE_FUNCS([setproctitle])
@@ -217,10 +242,11 @@ m4_popdef([AC_LANG_CALL(C)])
 AC_CACHE_SAVE
 
 ## Unit tests wich check
-PKG_CHECK_MODULES([CHECK], [check >= 0.9.4], [have_check=yes], [have_check=no])
+PKG_CHECK_MODULES([check], [check >= 0.9.4], [have_check=yes], [have_check=no])
 
 # Third-party libraries
 lldp_CHECK_LIBEVENT
+lldp_CHECK_LIBCAP
 
 # Compatibility with pkg.m4 < 0.27
 m4_ifdef([PKG_INSTALLDIR], [PKG_INSTALLDIR],
@@ -269,28 +295,8 @@ AC_ARG_WITH([xml],
   [with_xml=auto])
 lldp_CHECK_XML2
 
-# JSON
-AC_ARG_WITH([json],
-  AS_HELP_STRING(
-    [--with-json],
-    [Enable JSON output via janson or json-c @<:@default=auto@:>@]),
-  [],
-  [with_json=auto])
-if test x"$with_json" = x"yes" -o x"$with_json" = x"auto"; then
-   _with_json="$with_json"
-   with_json=auto
-   lldp_CHECK_JANSSON
-   if test x"$with_json" = x"no"; then
-     with_json=auto
-     lldp_CHECK_JSONC
-   fi
-   if test x"$with_json" = x"no" -a x"$_with_json" = x"yes"; then
-     AC_MSG_FAILURE([*** no JSON support found])
-   fi
-else
-   lldp_CHECK_JANSSON
-   lldp_CHECK_JSONC
-fi
+# JSON (built-in)
+lldp_ARG_ENABLE([json0], [use of pre-0.9.2 JSON/json-c format], [no])
 
 # Seccomp
 AC_ARG_WITH([seccomp],
@@ -346,6 +352,11 @@ lldp_ARG_WITH([privsep-chroot], [Which directory to use to chroot lldpd], [${run
 lldp_ARG_WITH([lldpd-ctl-socket], [Path to socket for communication with lldpd], [${runstatedir}/lldpd.socket])
 lldp_ARG_WITH([lldpd-pid-file], [Path to lldpd PID file], [${runstatedir}/lldpd.pid])
 
+# Netlink
+lldp_ARG_WITH_UNQUOTED([netlink-max-receive-bufsize], [Netlink maximum receive buffer size], [1024*1024])
+lldp_ARG_WITH_UNQUOTED([netlink-receive-bufsize], [Netlink initial receive buffer size], [0])
+lldp_ARG_WITH_UNQUOTED([netlink-send-bufsize], [Netlink send buffer size], [0])
+
 # CDP/FDP/EDP/SONMP
 lldp_ARG_ENABLE([cdp], [Cisco Discovery Protocol], [yes])
 lldp_ARG_ENABLE([fdp], [Foundry Discovery Protocol], [yes])
@@ -383,9 +394,6 @@ AC_SUBST([LLDP_BIN_LDFLAGS])
 AM_CONDITIONAL([HAVE_CHECK], [test x"$have_check" = x"yes"])
 AM_CONDITIONAL([USE_SNMP], [test x"$with_snmp" = x"yes"])
 AM_CONDITIONAL([USE_XML], [test x"$with_xml" = x"yes"])
-AM_CONDITIONAL([USE_JSON], [test x"$with_json" = x"json-c" || test -x"$with_json" = x"jansson"])
-AM_CONDITIONAL([USE_JANSSON], [test x"$with_json" = x"jansson"])
-AM_CONDITIONAL([USE_JSONC], [test x"$with_json" = x"json-c"])
 AM_CONDITIONAL([USE_SECCOMP], [test x"$with_seccomp" = x"yes"])
 dnl If old default of AR_FLAGS is otherwise being used (because of older automake),
 dnl replace it with one without 'u'
@@ -422,9 +430,9 @@ cat <<EOF
   DOT3...........: $enable_dot3
   CUSTOM.........: $enable_custom
   XML output.....: ${with_xml-no}
-  JSON output....: ${with_json-no}
   Oldies support.: $enable_oldies
   seccomp........: ${with_seccomp-no}
+  libbsd.........: ${with_libbsd-no}
 
  Privilege separation:
   Enabled........: $enable_privsep

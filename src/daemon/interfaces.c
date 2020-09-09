@@ -24,6 +24,17 @@
 #include <assert.h>
 #include <arpa/inet.h>
 
+static int
+lldpd_af(int af)
+{
+	switch (af) {
+	case LLDPD_AF_IPV4: return AF_INET;
+	case LLDPD_AF_IPV6: return AF_INET6;
+	case LLDPD_AF_LAST: return AF_MAX;
+	default: return AF_UNSPEC;
+	}
+}
+
 /* Generic ethernet interface initialization */
 /**
  * Enable multicast on the given interface.
@@ -166,7 +177,7 @@ interfaces_indextointerface(struct interfaces_device_list *interfaces,
 }
 
 void
-interfaces_helper_whitelist(struct lldpd *cfg,
+interfaces_helper_allowlist(struct lldpd *cfg,
     struct interfaces_device_list *interfaces)
 {
 	struct interfaces_device *iface;
@@ -178,11 +189,11 @@ interfaces_helper_whitelist(struct lldpd *cfg,
 		int m = pattern_match(iface->name, cfg->g_config.c_iface_pattern, 0);
 		switch (m) {
 		case 0:
-			log_debug("interfaces", "blacklist %s", iface->name);
+			log_debug("interfaces", "deny %s", iface->name);
 			iface->ignore = 1;
 			continue;
 		case 2:
-			log_debug("interfaces", "whitelist %s (consider it as a physical interface)",
+			log_debug("interfaces", "allow %s (consider it as a physical interface)",
 			    iface->name);
 			iface->type |= IFACE_PHYSICAL_T;
 			continue;
@@ -200,6 +211,8 @@ iface_append_vlan(struct lldpd *cfg,
 	    lldpd_get_hardware(cfg, lower->name, lower->index);
 	struct lldpd_port *port;
 	struct lldpd_vlan *v;
+	char *name = NULL;
+	uint16_t vlan_id;
 
 	if (hardware == NULL) {
 		log_debug("interfaces",
@@ -207,24 +220,41 @@ iface_append_vlan(struct lldpd *cfg,
 		    lower->name, vlan->name);
 		return;
 	}
-
-	/* Check if the VLAN is already here. */
 	port = &hardware->h_lport;
-	TAILQ_FOREACH(v, &port->p_vlans, v_entries)
-	    if (strncmp(vlan->name, v->v_name, IFNAMSIZ) == 0)
-		    return;
-	if ((v = (struct lldpd_vlan *)
-		calloc(1, sizeof(struct lldpd_vlan))) == NULL)
-		return;
-	if ((v->v_name = strdup(vlan->name)) == NULL) {
-		free(v);
-		return;
+
+	for (int i = 0; (i < VLAN_BITMAP_LEN); i++) {
+		if (vlan->vlan_bmap[i] == 0)
+			continue;
+		for (unsigned bit = 0; bit < 32; bit++) {
+			uint32_t mask = 1L << bit;
+			if (!(vlan->vlan_bmap[i] & mask))
+				continue;
+			vlan_id = (i * 32) + bit;
+			if (asprintf(&name, "vlan%d", vlan_id) == -1)
+				return;
+
+			/* Check if the VLAN is already here. */
+			TAILQ_FOREACH(v, &port->p_vlans, v_entries)
+				if (strncmp(name, v->v_name, IFNAMSIZ) == 0) {
+					free(name);
+					return;
+				}
+
+			if ((v = (struct lldpd_vlan *)
+				calloc(1, sizeof(struct lldpd_vlan))) == NULL) {
+				free(name);
+				return;
+			}
+			v->v_name = name;
+			v->v_vid = vlan_id;
+			if (vlan->pvid)
+				port->p_pvid = vlan->pvid;
+			log_debug("interfaces", "append VLAN %s for %s",
+				v->v_name,
+				hardware->h_ifname);
+			TAILQ_INSERT_TAIL(&port->p_vlans, v, v_entries);
+		}
 	}
-	v->v_vid = vlan->vlanid;
-	log_debug("interfaces", "append VLAN %s for %s",
-	    v->v_name,
-	    hardware->h_ifname);
-	TAILQ_INSERT_TAIL(&port->p_vlans, v, v_entries);
 }
 
 /**
@@ -244,7 +274,7 @@ iface_append_vlan_to_lower(struct lldpd *cfg,
     int depth)
 {
 	if (depth > 5) {
-		log_warn("interfaces",
+		log_warnx("interfaces",
 		    "BUG: maximum depth reached when applying VLAN %s (loop?)",
 		    vlan->name);
 		return;
@@ -254,6 +284,13 @@ iface_append_vlan_to_lower(struct lldpd *cfg,
 	log_debug("interfaces",
 	    "looking to apply VLAN %s to physical interface behind %s",
 	    vlan->name, upper->name);
+
+	/* Some bridges managed VLAN internally, skip them. */
+	if (upper->type & IFACE_BRIDGE_VLAN_T) {
+		log_debug("interfaces", "VLAN %s ignored for VLAN-aware bridge interface %s",
+		    vlan->name, upper->name);
+		return;
+	}
 
 	/* Easy: check if we have a lower interface. */
 	if (upper->lower) {
@@ -292,9 +329,7 @@ interfaces_helper_vlan(struct lldpd *cfg,
 	struct interfaces_device *iface;
 
 	TAILQ_FOREACH(iface, interfaces, next) {
-		if (iface->ignore)
-			continue;
-		if (!(iface->type & IFACE_VLAN_T))
+		if (!(iface->type & IFACE_VLAN_T) && bitmap_isempty(iface->vlan_bmap))
 			continue;
 
 		/* We need to find the physical interfaces of this
@@ -329,8 +364,12 @@ interfaces_helper_chassis(struct lldpd *cfg,
 		(LOCAL_CHASSIS(cfg)->c_cap_enabled == 0))
 	    LOCAL_CHASSIS(cfg)->c_cap_enabled = LLDP_CAP_STATION;
 
-	if (LOCAL_CHASSIS(cfg)->c_id != NULL &&
-	    LOCAL_CHASSIS(cfg)->c_id_subtype == LLDP_CHASSISID_SUBTYPE_LLADDR)
+	/* Do not modify the chassis if it's already set to a MAC address or if
+	 * it's set to a local address equal to the user-provided
+	 * configuration. */
+	if ((LOCAL_CHASSIS(cfg)->c_id != NULL &&
+	    LOCAL_CHASSIS(cfg)->c_id_subtype == LLDP_CHASSISID_SUBTYPE_LLADDR) ||
+	    cfg->g_config.c_cid_string != NULL)
 		return;		/* We already have one */
 
 	TAILQ_FOREACH(iface, interfaces, next) {
@@ -372,16 +411,18 @@ interfaces_helper_chassis(struct lldpd *cfg,
 
 /* Add management addresses for the given family. We only take one of each
    address family, unless a pattern is provided and is not all negative. For
-   example !*:*,!10.* will only blacklist addresses. We will pick the first IPv4
+   example !*:*,!10.* will only deny addresses. We will pick the first IPv4
    address not matching 10.*.
 */
 static int
 interfaces_helper_mgmt_for_af(struct lldpd *cfg,
     int af,
     struct interfaces_address_list *addrs,
+    struct interfaces_device_list *interfaces,
     int global, int allnegative)
 {
 	struct interfaces_address *addr;
+	struct interfaces_device *device;
 	struct lldpd_mgmt *mgmt;
 	char addrstrbuf[INET6_ADDRSTRLEN];
 	int found = 0;
@@ -427,7 +468,11 @@ interfaces_helper_mgmt_for_af(struct lldpd *cfg,
 			continue;
 		}
 		if (cfg->g_config.c_mgmt_pattern == NULL ||
-		    pattern_match(addrstrbuf, cfg->g_config.c_mgmt_pattern, allnegative)) {
+		    /* Match on IP address */
+		    pattern_match(addrstrbuf, cfg->g_config.c_mgmt_pattern, allnegative) ||
+		    /* Match on interface name */
+		    ((device = interfaces_indextointerface(interfaces, addr->index)) &&
+		    pattern_match(device->name, cfg->g_config.c_mgmt_pattern, allnegative))) {
 			mgmt = lldpd_alloc_mgmt(af, &in_addr, in_addr_size,
 			    addr->index);
 			if (mgmt == NULL) {
@@ -452,7 +497,8 @@ interfaces_helper_mgmt_for_af(struct lldpd *cfg,
    to the local chassis). */
 void
 interfaces_helper_mgmt(struct lldpd *cfg,
-    struct interfaces_address_list *addrs)
+    struct interfaces_address_list *addrs,
+    struct interfaces_device_list *interfaces)
 {
 	int allnegative = 0;
 	int af;
@@ -464,8 +510,11 @@ interfaces_helper_mgmt(struct lldpd *cfg,
 
 	/* Is the pattern provided an actual IP address? */
 	if (pattern && strpbrk(pattern, "!,*?") == NULL) {
-		struct in6_addr addr;
+		unsigned char addr[sizeof(struct in6_addr)];
 		size_t addr_size;
+		struct lldpd_mgmt *mgmt;
+		struct interfaces_address *ifaddr;
+
 		for (af = LLDPD_AF_UNSPEC + 1;
 		     af != LLDPD_AF_LAST; af++) {
 			switch (af) {
@@ -473,24 +522,41 @@ interfaces_helper_mgmt(struct lldpd *cfg,
 			case LLDPD_AF_IPV6: addr_size = sizeof(struct in6_addr); break;
 			default: assert(0);
 			}
-			if (inet_pton(lldpd_af(af), pattern, &addr) == 1)
+			if (inet_pton(lldpd_af(af), pattern, addr) == 1)
 				break;
 		}
-		if (af == LLDPD_AF_LAST) {
-			log_debug("interfaces",
-			    "interface management pattern is an incorrect IP");
-		} else {
-			struct lldpd_mgmt *mgmt;
-			mgmt = lldpd_alloc_mgmt(af, &addr, addr_size, 0);
+		if (af != LLDPD_AF_LAST) {
+			/* Try to get the index if possible. */
+			TAILQ_FOREACH(ifaddr, addrs, next) {
+				if (ifaddr->address.ss_family != lldpd_af(af))
+					continue;
+				if (LLDPD_AF_IPV4 == af) {
+					struct sockaddr_in *sa_sin;
+					sa_sin = (struct sockaddr_in *)&ifaddr->address;
+					if (0 == memcmp(addr,
+					    &(sa_sin->sin_addr),
+					    addr_size))
+						break;
+				}
+				else if (LLDPD_AF_IPV6 == af) {
+					if (0 == memcmp(addr,
+					    &((struct sockaddr_in6 *)&ifaddr->address)->sin6_addr,
+					    addr_size))
+						break;
+				}
+			}
+
+			mgmt = lldpd_alloc_mgmt(af, addr, addr_size, ifaddr ? ifaddr->index : 0);
 			if (mgmt == NULL) {
 				log_warn("interfaces", "out of memory error");
 				return;
 			}
 			log_debug("interfaces", "add exact management address %s",
-				pattern);
+			    pattern);
 			TAILQ_INSERT_TAIL(&LOCAL_CHASSIS(cfg)->c_mgmt, mgmt, m_entries);
+			return;
 		}
-		return;
+		/* else: could be an interface name */
 	}
 
 	/* Is the pattern provided all negative? */
@@ -506,8 +572,8 @@ interfaces_helper_mgmt(struct lldpd *cfg,
 
 	/* Find management addresses */
 	for (af = LLDPD_AF_UNSPEC + 1; af != LLDPD_AF_LAST; af++) {
-		(void)(interfaces_helper_mgmt_for_af(cfg, af, addrs, 1, allnegative) ||
-		    interfaces_helper_mgmt_for_af(cfg, af, addrs, 0, allnegative));
+		(void)(interfaces_helper_mgmt_for_af(cfg, af, addrs, interfaces, 1, allnegative) ||
+		    interfaces_helper_mgmt_for_af(cfg, af, addrs, interfaces, 0, allnegative));
 	}
 }
 
@@ -706,6 +772,7 @@ interfaces_send_helper(struct lldpd *cfg,
 				break;
 			}
 			/* Fallback to fixed value */
+			/* FALL THROUGH */
 		case LLDP_BOND_SLAVE_SRC_MAC_TYPE_FIXED:
 			memcpy(src_mac, arbitrary, ETHER_ADDR_LEN);
 			break;

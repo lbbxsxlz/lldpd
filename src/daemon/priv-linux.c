@@ -18,6 +18,7 @@
 #include "lldpd.h"
 
 #include <unistd.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -30,8 +31,8 @@
 #pragma clang diagnostic ignored "-Wdocumentation"
 #endif
 #include <linux/filter.h>     /* For BPF filtering */
-#include <linux/ethtool.h>
 #include <linux/sockios.h>
+#include <linux/if_ether.h>
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
@@ -51,49 +52,6 @@ priv_open(char *file)
 	if (rc == -1)
 		return rc;
 	return receive_fd(PRIV_UNPRIVILEGED);
-}
-
-static int
-asroot_ethtool_real(const char *ifname, struct ethtool_cmd *ethc) {
-	int rc, sock = -1;
-	struct ifreq ifr = {
-		.ifr_data = (caddr_t)ethc
-	};
-	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
-
-	memset(ethc, 0, sizeof(struct ethtool_cmd));
-	ethc->cmd = ETHTOOL_GSET;
-	if (((rc = sock = socket(AF_INET, SOCK_DGRAM, 0)) == -1) ||
-	    (rc = ioctl(sock, SIOCETHTOOL, &ifr)) != 0) {
-		if (sock != -1) close(sock);
-		return rc;
-	}
-	close(sock);
-	return rc;
-}
-
-/* Proxy for ethtool ioctl (GSET only). Not needed since
- * 0fdc100bdc4b7ab61ed632962c76dfe539047296 (2.6.37). */
-int
-priv_ethtool(char *ifname, struct ethtool_cmd *ethc)
-{
-	int rc;
-#ifdef ENABLE_OLDIES
-	int len;
-	enum priv_cmd cmd = PRIV_ETHTOOL;
-	must_write(PRIV_UNPRIVILEGED, &cmd, sizeof(enum priv_cmd));
-	len = strlen(ifname);
-	must_write(PRIV_UNPRIVILEGED, &len, sizeof(int));
-	must_write(PRIV_UNPRIVILEGED, ifname, len);
-	priv_wait();
-	must_read(PRIV_UNPRIVILEGED, &rc, sizeof(int));
-	if (rc != 0)
-		return rc;
-	must_read(PRIV_UNPRIVILEGED, ethc, sizeof(struct ethtool_cmd));
-#else
-	rc = asroot_ethtool_real(ifname, ethc);
-#endif
-	return rc;
 }
 
 void
@@ -156,34 +114,13 @@ asroot_open()
 	close(fd);
 }
 
-#ifdef ENABLE_OLDIES
-void
-asroot_ethtool()
-{
-	struct ethtool_cmd ethc;
-	int len, rc;
-	char *ifname;
-
-	must_read(PRIV_PRIVILEGED, &len, sizeof(int));
-	if ((ifname = (char*)malloc(len + 1)) == NULL)
-		fatal("privsep", NULL);
-	must_read(PRIV_PRIVILEGED, ifname, len);
-	ifname[len] = '\0';
-	rc = asroot_ethtool_real(ifname, &ethc);
-	free(ifname);
-	must_write(PRIV_PRIVILEGED, &rc, sizeof(int));
-	if (rc == -1) return;
-	must_write(PRIV_PRIVILEGED, &ethc, sizeof(struct ethtool_cmd));
-}
-#endif
-
 int
-asroot_iface_init_os(int ifindex, char *name, int *fd)
+asroot_iface_init_os(int ifindex, char *name, int *fd, int proto)
 {
 	int rc;
 	/* Open listening socket to receive/send frames */
 	if ((*fd = socket(PF_PACKET, SOCK_RAW,
-		    htons(ETH_P_ALL))) < 0) {
+		    htons(proto))) < 0) {
 		rc = errno;
 		return rc;
 	}
@@ -208,19 +145,32 @@ asroot_iface_init_os(int ifindex, char *name, int *fd)
 		.len = sizeof(lldpd_filter_f) / sizeof(struct sock_filter)
 	};
 	if (setsockopt(*fd, SOL_SOCKET, SO_ATTACH_FILTER,
-                &prog, sizeof(prog)) < 0) {
+	    &prog, sizeof(prog)) < 0) {
 		rc = errno;
 		log_warn("privsep", "unable to change filter for %s", name);
 		return rc;
 	}
 
 #ifdef SO_LOCK_FILTER
-	int enable = 1;
+	int lock = 1;
 	if (setsockopt(*fd, SOL_SOCKET, SO_LOCK_FILTER,
-		&enable, sizeof(enable)) < 0) {
+	    &lock, sizeof(lock)) < 0) {
 		if (errno != ENOPROTOOPT) {
 			rc = errno;
 			log_warn("privsep", "unable to lock filter for %s", name);
+			return rc;
+		}
+	}
+#endif
+#ifdef PACKET_IGNORE_OUTGOING
+	int ignore = 1;
+	if (setsockopt(*fd, SOL_PACKET, PACKET_IGNORE_OUTGOING,
+	    &ignore, sizeof(ignore)) < 0) {
+		if (errno != ENOPROTOOPT) {
+			rc = errno;
+			log_warn("privsep",
+			    "unable to set packet direction for BPF filter on %s",
+			    name);
 			return rc;
 		}
 	}
@@ -251,9 +201,9 @@ asroot_iface_description_os(const char *name, const char *description)
 	}
 	if ((fp = fopen(file, "r+")) == NULL) {
 		rc = errno;
+		log_debug("privsep", "cannot open interface description for %s: %s",
+		    name, strerror(errno));
 		free(file);
-		log_debug("privsep", "cannot open interface description for %s",
-		    name);
 		return rc;
 	}
 	free(file);

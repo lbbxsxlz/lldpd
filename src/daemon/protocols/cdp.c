@@ -19,6 +19,17 @@
 #include "lldpd.h"
 #include "frame.h"
 
+/*
+ * CDP Requests Power at the switch output and therefore has to take into
+ * account the loss in the PoE cable. This is done by the switch automatically
+ * if lldp is used as the protocol.
+ */
+#define CDP_CLASS_3_MAX_PSE_POE	          154 /* 15.4W Max PoE at PSE class 3 */
+#define CDP_SWTICH_DEFAULT_POE_PD         130 /* 13.W default PoE at PD */
+#define CDP_SWTICH_DEFAULT_POE_PSE        154 /* 15.4W default PoE at PSE */
+#define CDP_SWITCH_POE_CLASS_4_OFFSET     45  /* 4.5W  max loss from cable */
+#define CDP_SWITCH_POE_CLASS_3_OFFSET     24  /* 2.4W  max loss from cable */
+
 #if defined (ENABLE_CDP) || defined (ENABLE_FDP)
 
 #include <stdio.h>
@@ -87,7 +98,7 @@ cdp_send(struct lldpd *global,
 	if (!(
 	      POKE_SAVE(pos_cdp) &&
 	      POKE_UINT8((version == 0)?1:version) &&
-	      POKE_UINT8(chassis->c_ttl) &&
+	      POKE_UINT8(global?global->g_config.c_ttl:180) &&
 	      POKE_SAVE(pos_checksum) && /* Save checksum position */
 	      POKE_UINT16(0)))
 		goto toobig;
@@ -201,7 +212,51 @@ cdp_send(struct lldpd *global,
 	      POKE_END_CDP_TLV))
 		goto toobig;
 
-#ifdef ENABLE_LLDPMED
+#ifdef ENABLE_DOT3
+	if ((version >= 2) &&
+	    (port->p_power.powertype != LLDP_DOT3_POWER_8023AT_OFF) &&
+	    (port->p_power.devicetype == LLDP_DOT3_POWER_PD) &&
+	    (port->p_power.requested > 0) &&
+	    (port->p_power.requested <= 655)) {
+		u_int16_t requested;
+		u_int16_t consumption;
+
+		if (port->p_power.requested != port->p_power.allocated) {
+			port->p_cdp_power.request_id++;
+			log_debug("cdp", "requested: %d, allocated:%d", port->p_power.requested, port->p_power.allocated);
+		}
+		consumption = port->p_power.allocated ? port->p_power.allocated : CDP_SWTICH_DEFAULT_POE_PD;
+		if (consumption > 130) {
+			consumption += CDP_SWITCH_POE_CLASS_4_OFFSET;
+		} else {
+			consumption += CDP_SWITCH_POE_CLASS_3_OFFSET;
+		}
+		if (port->p_power.requested > 130) { /* Class 4 */
+			requested = port->p_power.requested + CDP_SWITCH_POE_CLASS_4_OFFSET;
+		} else { /* Class 3 */
+			requested = port->p_power.requested + CDP_SWITCH_POE_CLASS_3_OFFSET;
+		}
+		if (!(
+		      POKE_START_CDP_TLV(CDP_TLV_POWER_CONSUMPTION) &&
+		      POKE_UINT16(consumption * 100) &&
+		      POKE_END_CDP_TLV))
+			goto toobig;
+		/* Avoid request id 0 from overflow */
+		if (!port->p_cdp_power.request_id) {
+			port->p_cdp_power.request_id = 1;
+		}
+		if (!port->p_cdp_power.management_id) {
+			port->p_cdp_power.management_id = 1;
+		}
+		if (!(
+		      POKE_START_CDP_TLV(CDP_TLV_POWER_REQUESTED) &&
+		      POKE_UINT16(port->p_cdp_power.request_id) &&
+		      POKE_UINT16(port->p_cdp_power.management_id) &&
+		      POKE_UINT32(requested * 100) &&
+		      POKE_END_CDP_TLV))
+			goto toobig;
+	}
+#elif defined(ENABLE_LLDPMED)
 	/* Power use */
 	if ((version >= 2) &&
 	    port->p_med_cap_enabled &&
@@ -214,7 +269,8 @@ cdp_send(struct lldpd *global,
 		      POKE_END_CDP_TLV))
 			goto toobig;
 	}
-#endif
+#endif 
+
 	(void)POKE_SAVE(end);
 
 	/* Compute len and checksum */
@@ -320,6 +376,10 @@ cdp_decode(struct lldpd *cfg, char *frame, int s,
 		    hardware->h_ifname);
 		goto malformed;
 	}
+
+	/* This is the correct length of the CDP + LLC packets */
+	length = len_eth;
+
 	PEEK_DISCARD(6);	/* Skip beginning of LLC */
 	proto = PEEK_UINT16;
 	if (proto != LLC_PID_CDP) {
@@ -358,7 +418,7 @@ cdp_decode(struct lldpd *cfg, char *frame, int s,
 		    version, hardware->h_ifname);
 		goto malformed;
 	}
-	chassis->c_ttl = PEEK_UINT8; /* TTL */
+	port->p_ttl = PEEK_UINT8; /* TTL */
 	PEEK_DISCARD_UINT16;	     /* Checksum, already checked */
 
 	while (length) {
@@ -370,6 +430,7 @@ cdp_decode(struct lldpd *cfg, char *frame, int s,
 		}
 		tlv_type = PEEK_UINT16;
 		tlv_len = PEEK_UINT16 - 4;
+
 		(void)PEEK_SAVE(tlv);
 		if ((tlv_len < 0) || (length < tlv_len)) {
 			log_warnx("cdp", "incorrect size in CDP/FDP TLV header for frame "
@@ -523,6 +584,30 @@ cdp_decode(struct lldpd *cfg, char *frame, int s,
 					  vlan, v_entries);
 			break;
 #endif
+#ifdef ENABLE_DOT3
+		case CDP_TLV_POWER_AVAILABLE:
+			CHECK_TLV_SIZE(12, "Power Available");
+			/* check if it is a respone to a request id */
+			if (PEEK_UINT16 > 0) {
+				port->p_cdp_power.management_id = PEEK_UINT16;
+				port->p_power.allocated = PEEK_UINT32;
+				port->p_power.allocated /= 100;
+				port->p_power.supported = 1;
+				port->p_power.enabled = 1;
+				port->p_power.devicetype = LLDP_DOT3_POWER_PSE;
+				port->p_power.powertype = LLDP_DOT3_POWER_8023AT_TYPE2;
+				log_debug("cdp", "Allocated power %d00", port->p_power.allocated);
+				if (port->p_power.allocated > CDP_CLASS_3_MAX_PSE_POE) {
+					port->p_power.allocated -= CDP_SWITCH_POE_CLASS_4_OFFSET;
+				} else if (port->p_power.allocated > CDP_SWITCH_POE_CLASS_3_OFFSET ) {
+					port->p_power.allocated -= CDP_SWITCH_POE_CLASS_3_OFFSET;
+				} else {
+					port->p_power.allocated = 0;
+				}
+				port->p_power.requested = hardware->h_lport.p_power.requested;
+			}
+			break;
+#endif
 		default:
 			log_debug("cdp", "unknown CDP/FDP TLV type (%d) received on %s",
 			    ntohs(tlv_type), hardware->h_ifname);
@@ -563,7 +648,7 @@ cdp_decode(struct lldpd *cfg, char *frame, int s,
 	    (chassis->c_name == NULL) ||
 	    (chassis->c_descr == NULL) ||
 	    (port->p_descr == NULL) ||
-	    (chassis->c_ttl == 0) ||
+	    (port->p_ttl == 0) ||
 	    (chassis->c_cap_enabled == 0)) {
 		log_warnx("cdp", "some mandatory CDP/FDP tlv are missing for frame received on %s",
 		    hardware->h_ifname);
